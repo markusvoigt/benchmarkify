@@ -1,6 +1,9 @@
 {
   "name": "benchmarkify",
   "version": "1.0.0",
+  "engines": {
+    "node": "20.19.1"
+  },
   "description": "Shopify store benchmarking tool",
   "main": "server.js",
   "scripts": {

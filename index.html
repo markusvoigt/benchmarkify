@@ -77,18 +77,18 @@
                     <div class="config-grid">
                         <div class="config-item">
                             <label for="createCount">Products to Create:</label>
-                            <input type="number" id="createCount" name="createCount" min="1" max="10000" value="100" class="config-input">
-                            <small>Creates new products with random data (1-10,000)</small>
+                            <input type="number" id="createCount" name="createCount" min="1" max="1000000" value="100" class="config-input">
+                            <small>Creates new products with random data (1-1,000,000)</small>
                         </div>
                         <div class="config-item">
                             <label for="updateCount">Products to Update:</label>
-                            <input type="number" id="updateCount" name="updateCount" min="1" max="10000" value="100" class="config-input">
-                            <small>Updates existing benchmark products (1-10,000)</small>
+                            <input type="number" id="updateCount" name="updateCount" min="1" max="1000000" value="100" class="config-input">
+                            <small>Updates existing benchmark products (1-1,000,000)</small>
                         </div>
                         <div class="config-item">
                             <label for="deleteCount">Products to Delete:</label>
-                            <input type="number" id="deleteCount" name="deleteCount" min="1" max="10000" value="100" class="config-input">
-                            <small>Deletes only benchmark-created products (1-10,000)</small>
+                            <input type="number" id="deleteCount" name="deleteCount" min="1" max="1000000" value="100" class="config-input">
+                            <small>Deletes only benchmark-created products (1-1,000,000)</small>
                         </div>
                     </div>
                     <div class="safety-info">
@@ -96,33 +96,7 @@
                         <p>All benchmark products are tagged with <code>benchmarkify-{timestamp}</code> to ensure we only modify our test data.</p>
                     </div>
                     
-                    <div class="performance-config" style="margin-top: 15px; padding: 15px; background: #fef3c7; border-radius: 8px; border: 1px solid #f59e0b;">
-                        <h4 style="margin-top: 0; color: #92400e;">⚡ Performance Configuration</h4>
-                        <div class="performance-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
-                            <div>
-                                <label for="batchSize">Batch Size:</label>
-                                <input type="number" id="batchSize" name="batchSize" min="1" max="100" value="10" class="config-input">
-                                <small>API calls per batch (1-100)</small>
-                            </div>
-                            <div>
-                                <label for="delayBetweenBatches">Delay (ms):</label>
-                                <input type="number" id="delayBetweenBatches" name="delayBetweenBatches" min="0" max="5000" value="100" class="config-input">
-                                <small>Delay between batches (0-5000ms)</small>
-                            </div>
-                        </div>
-                        <div style="margin-top: 10px; padding: 8px; background: #fef3c7; border-radius: 4px;">
-                            <p style="margin: 0; font-size: 0.85rem; color: #92400e;">
-                                <strong>💡 Performance Tip:</strong> Higher batch sizes increase throughput but may hit rate limits faster. 
-                                Adjust delay between batches to balance speed vs. API limits.
-                            </p>
-                            <div style="margin-top: 8px; padding: 8px; background: #fee2e2; border-radius: 4px; border-left: 3px solid #dc2626;">
-                                <p style="margin: 0; font-size: 0.8rem; color: #991b1b;">
-                                    <strong>⚠️ Rate Limit Warning:</strong> High-volume operations (1000+ products) may hit Shopify's API rate limits. 
-                                    Monitor the rate limit info during benchmarks and adjust batch size/delay accordingly.
-                                </p>
-                            </div>
-                        </div>
-                    </div>
+
                     
                     <div class="operations-summary" id="operationsSummary" style="margin-top: 15px; padding: 15px; background: #e6fffa; border-radius: 8px; border: 1px solid #81e6d9; display: none;">
                         <h4 style="margin-top: 0; color: #065f46;">📋 Selected Operations</h4>
@@ -136,10 +110,33 @@
                         <button type="button" class="btn-secondary" id="testConnection">Test GraphQL Connection</button>
                         <button type="button" class="btn-secondary" id="testSchema">Get Schema Info</button>
                         <button type="button" class="btn-secondary" id="testProductCreate">Test Product Creation</button>
+                        <button type="button" class="btn-secondary" id="analyzeRateLimits">Analyze Rate Limits</button>
                     </div>
                     <div id="testResults" style="margin-top: 15px; padding: 15px; background: #f0f8ff; border-radius: 8px; display: none;">
                         <h4>Test Results:</h4>
                         <pre id="testOutput"></pre>
+                    </div>
+                </div>
+
+                <div class="credential-storage" style="margin-top: 20px; padding: 20px; background: #f0f9ff; border-radius: 10px; border: 1px solid #0ea5e9;">
+                    <h3>💾 Store Credentials for Reuse</h3>
+                    <p style="color: #0c4a6e; margin-bottom: 15px;">
+                        Store your credentials securely to easily test the same store again. Credentials are stored client-side and expire after 24 hours.
+                    </p>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        <button type="button" class="btn-secondary" id="storeCredentials">💾 Store Current Credentials</button>
+                        <button type="button" class="btn-secondary" id="loadStoredCredentials">📂 Load Stored Credentials</button>
+                        <button type="button" class="btn-secondary" id="clearStoredCredentials">🗑️ Clear Stored Credentials</button>
+                    </div>
+                    <div id="credentialStatus" style="margin-top: 15px; padding: 10px; background: #ecfdf5; border-radius: 6px; display: none;">
+                        <p id="credentialMessage" style="margin: 0; color: #065f46;"></p>
+                    </div>
+                </div>
+
+                <div class="rate-limit-explanation" id="rateLimitExplanation" style="display: none; margin-top: 20px; padding: 20px; background: #e6fffa; border-radius: 10px; border: 1px solid #81e6d9;">
+                    <h3>📚 Understanding Your API Rate Limits</h3>
+                    <div id="rateLimitExplanationContent" style="color: #065f46;">
+                        <!-- Rate limit explanation content will be populated here -->
                     </div>
                 </div>
             </div>
@@ -191,6 +188,31 @@
                             <div class="card-header">Max Products/sec</div>
                             <div class="card-value" id="maxProductsPerSecond">-</div>
                             <div class="card-label">Theoretical limit</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="performance-projections" id="performanceProjections" style="display: none; margin-top: 30px; padding: 20px; background: #fef3c7; border-radius: 10px; border: 1px solid #f59e0b;">
+                    <h3>🚀 Performance Projections</h3>
+                    <p style="color: #92400e; margin-bottom: 20px;">
+                        Based on your benchmark results, here are estimated performance metrics for larger operations:
+                    </p>
+                    <div class="projections-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px;">
+                        <div class="projection-card" style="padding: 15px; background: white; border-radius: 8px; border: 1px solid #f59e0b;">
+                            <h4 style="margin-top: 0; color: #92400e;">1,000 Products</h4>
+                            <div id="projection1000" style="color: #92400e; font-size: 0.9rem;"></div>
+                        </div>
+                        <div class="projection-card" style="padding: 15px; background: white; border-radius: 8px; border: 1px solid #f59e0b;">
+                            <h4 style="margin-top: 0; color: #92400e;">100,000 Products</h4>
+                            <div id="projection100k" style="color: #92400e; font-size: 0.9rem;"></div>
+                        </div>
+                        <div class="projection-card" style="padding: 15px; background: white; border-radius: 8px; border: 1px solid #f59e0b;">
+                            <h4 style="margin-top: 0; color: #92400e;">1,000,000 Products</h4>
+                            <div id="projection1m" style="color: #92400e; font-size: 0.9rem;"></div>
+                        </div>
+                        <div class="projection-card" style="padding: 15px; background: white; border-radius: 8px; border: 1px solid #f59e0b;">
+                            <h4 style="margin-top: 0; color: #92400e;">10,000,000 Products</h4>
+                            <div id="projection10m" style="color: #92400e; font-size: 0.9rem;"></div>
                         </div>
                     </div>
                 </div>

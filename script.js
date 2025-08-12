@@ -22,8 +22,28 @@ class Benchmarkify {
     this.deleteQuery = document.getElementById("deleteQuery");
     this.queryQuery = document.getElementById("queryQuery");
 
+    // New elements for performance projections and rate limit explanation
+    this.performanceProjections = document.getElementById(
+      "performanceProjections"
+    );
+    this.rateLimitExplanation = document.getElementById("rateLimitExplanation");
+    this.rateLimitExplanationContent = document.getElementById(
+      "rateLimitExplanationContent"
+    );
+
+    // Credential storage elements
+    this.credentialStatus = document.getElementById("credentialStatus");
+    this.credentialMessage = document.getElementById("credentialMessage");
+
+    // Performance projection elements
+    this.projection1000 = document.getElementById("projection1000");
+    this.projection100k = document.getElementById("projection100k");
+    this.projection1m = document.getElementById("projection1m");
+    this.projection10m = document.getElementById("projection10m");
+
     this.bindEvents();
     this.initializeGraphQLQueries();
+    this.loadStoredCredentials();
   }
 
   bindEvents() {
@@ -55,6 +75,37 @@ class Benchmarkify {
         e.stopPropagation();
         console.log("🔍 Test Product Create button clicked");
         this.testProductCreation();
+      });
+    document
+      .getElementById("analyzeRateLimits")
+      .addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        console.log("🔍 Analyze Rate Limits button clicked");
+        this.analyzeRateLimits();
+      });
+
+    // Credential storage events
+    document
+      .getElementById("storeCredentials")
+      .addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.storeCredentials();
+      });
+    document
+      .getElementById("loadStoredCredentials")
+      .addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.loadStoredCredentials();
+      });
+    document
+      .getElementById("clearStoredCredentials")
+      .addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.clearStoredCredentials();
       });
 
     // Operation checkbox events
@@ -192,10 +243,9 @@ class Benchmarkify {
     const updateCount = document.getElementById("updateCount").value;
     const deleteCount = document.getElementById("deleteCount").value;
 
-    const batchSize = document.getElementById("batchSize").value;
-    const delayBetweenBatches = document.getElementById(
-      "delayBetweenBatches"
-    ).value;
+    // Dynamic batch size and delay based on rate limits (will be calculated by backend)
+    const batchSize = 10; // Default, will be overridden by backend
+    const delayBetweenBatches = 100; // Default, will be overridden by backend
 
     const operationsSummary = document.getElementById("operationsSummary");
     const operationsList = document.getElementById("operationsList");
@@ -215,9 +265,7 @@ class Benchmarkify {
     }
 
     if (operations.length > 0) {
-      operations.push(
-        `⚡ Batch Size: ${batchSize} | Delay: ${delayBetweenBatches}ms`
-      );
+      operations.push(`⚡ Dynamic configuration based on rate limits`);
       operationsList.innerHTML = operations.join("<br>");
       operationsSummary.style.display = "block";
     } else {
@@ -333,22 +381,21 @@ class Benchmarkify {
       : 0;
 
     // Get performance configuration
-    const batchSize =
-      parseInt(document.getElementById("batchSize").value) || 10;
-    const delayBetweenBatches =
-      parseInt(document.getElementById("delayBetweenBatches").value) || 100;
+    // Dynamic configuration will be set by backend based on rate limits
+    const batchSize = 10; // Default, will be overridden
+    const delayBetweenBatches = 100; // Default, will be overridden
 
     // Validate configuration for enabled operations
-    if (enableCreate && (createCount < 1 || createCount > 10000)) {
-      alert("Please enter a valid number of products to create (1-10,000)");
+    if (enableCreate && (createCount < 1 || createCount > 1000000)) {
+      alert("Please enter a valid number of products to create (1-1,000,000)");
       return;
     }
-    if (enableUpdate && (updateCount < 1 || updateCount > 10000)) {
-      alert("Please enter a valid number of products to update (1-10,000)");
+    if (enableUpdate && (updateCount < 1 || updateCount > 1000000)) {
+      alert("Please enter a valid number of products to update (1-1,000,000)");
       return;
     }
-    if (enableDelete && (deleteCount < 1 || deleteCount > 10000)) {
-      alert("Please enter a valid number of products to delete (1-10,000)");
+    if (enableDelete && (deleteCount < 1 || deleteCount > 1000000)) {
+      alert("Please enter a valid number of products to delete (1-1,000,000)");
       return;
     }
 
@@ -628,6 +675,16 @@ class Benchmarkify {
     }
 
     detailsCell.textContent = result.details || "-";
+
+    // Store performance projections for later display
+    if (result.performanceProjections) {
+      this.storePerformanceProjections(result.performanceProjections);
+    }
+  }
+
+  storePerformanceProjections(projections) {
+    // Store the latest projections for display
+    this.latestProjections = projections;
   }
 
   updateStatus(message) {
@@ -858,6 +915,11 @@ class Benchmarkify {
       `;
 
       this.summary.style.display = "block";
+
+      // Show performance projections if available
+      if (this.latestProjections) {
+        this.showPerformanceProjections(this.latestProjections);
+      }
     } catch (error) {
       console.error("Error in showSummary:", error);
       // Fallback to simple summary
@@ -981,6 +1043,339 @@ class Benchmarkify {
       console.error("Error viewing audit summary:", error);
       alert(`Failed to view audit summary: ${error.message}`);
     }
+  }
+
+  // Credential storage methods
+  async storeCredentials() {
+    const storeUrl = document.getElementById("storeUrl").value;
+    const accessToken = document.getElementById("accessToken").value;
+
+    if (!storeUrl || !accessToken) {
+      this.showCredentialMessage(
+        "Please enter store URL and access token first",
+        "error"
+      );
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/store-credentials", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ storeUrl, accessToken }),
+      });
+
+      const result = await response.json();
+
+      if (result.status === "success") {
+        // Store in localStorage as backup
+        localStorage.setItem(
+          "benchmarkify_credentials",
+          JSON.stringify({
+            storeUrl,
+            accessToken,
+            sessionId: result.sessionId,
+            timestamp: Date.now(),
+          })
+        );
+
+        this.showCredentialMessage(
+          `Credentials stored successfully! Session ID: ${result.sessionId}`,
+          "success"
+        );
+      } else {
+        this.showCredentialMessage(
+          `Failed to store credentials: ${result.message}`,
+          "error"
+        );
+      }
+    } catch (error) {
+      this.showCredentialMessage(
+        `Error storing credentials: ${error.message}`,
+        "error"
+      );
+    }
+  }
+
+  loadStoredCredentials() {
+    try {
+      // Try localStorage first
+      const stored = localStorage.getItem("benchmarkify_credentials");
+      if (stored) {
+        const credentials = JSON.parse(stored);
+
+        // Check if credentials are expired (24 hours)
+        const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+        if (credentials.timestamp > oneDayAgo) {
+          document.getElementById("storeUrl").value = credentials.storeUrl;
+          document.getElementById("accessToken").value =
+            credentials.accessToken;
+          this.showCredentialMessage(
+            "Credentials loaded from local storage",
+            "success"
+          );
+          return;
+        } else {
+          localStorage.removeItem("benchmarkify_credentials");
+        }
+
+        // Try server-side storage if we have a sessionId
+        if (credentials.sessionId) {
+          this.loadCredentialsFromServer(credentials.sessionId);
+          return;
+        }
+      }
+
+      this.showCredentialMessage("No stored credentials found", "info");
+    } catch (error) {
+      this.showCredentialMessage(
+        `Error loading credentials: ${error.message}`,
+        "error"
+      );
+    }
+  }
+
+  async loadCredentialsFromServer(sessionId) {
+    try {
+      const response = await fetch(`/api/stored-credentials/${sessionId}`);
+      const result = await response.json();
+
+      if (result.status === "success") {
+        document.getElementById("storeUrl").value = result.storeUrl;
+        this.showCredentialMessage("Credentials loaded from server", "success");
+      } else {
+        this.showCredentialMessage(
+          `Failed to load credentials: ${result.error}`,
+          "error"
+        );
+      }
+    } catch (error) {
+      this.showCredentialMessage(
+        `Error loading credentials from server: ${error.message}`,
+        "error"
+      );
+    }
+  }
+
+  clearStoredCredentials() {
+    localStorage.removeItem("benchmarkify_credentials");
+    document.getElementById("storeUrl").value = "";
+    document.getElementById("accessToken").value = "";
+    this.showCredentialMessage("Stored credentials cleared", "success");
+  }
+
+  showCredentialMessage(message, type) {
+    this.credentialMessage.textContent = message;
+    this.credentialStatus.style.display = "block";
+
+    // Update styling based on message type
+    this.credentialStatus.className = "";
+    this.credentialStatus.classList.add("credential-status");
+
+    if (type === "success") {
+      this.credentialStatus.style.background = "#ecfdf5";
+      this.credentialStatus.style.border = "1px solid #10b981";
+      this.credentialMessage.style.color = "#065f46";
+    } else if (type === "error") {
+      this.credentialStatus.style.background = "#fef2f2";
+      this.credentialStatus.style.border = "1px solid #ef4444";
+      this.credentialMessage.style.color = "#991b1b";
+    } else {
+      this.credentialStatus.style.background = "#f0f9ff";
+      this.credentialStatus.style.border = "1px solid #0ea5e9";
+      this.credentialMessage.style.color = "#0c4a6e";
+    }
+  }
+
+  // Rate limit analysis method
+  async analyzeRateLimits() {
+    const storeUrl = document.getElementById("storeUrl").value;
+    const accessToken = document.getElementById("accessToken").value;
+
+    if (!storeUrl || !accessToken) {
+      alert("Please enter store URL and access token first");
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/rate-limit-analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ storeUrl, accessToken }),
+      });
+
+      const result = await response.json();
+      this.showRateLimitAnalysis(result);
+    } catch (error) {
+      alert(`Error analyzing rate limits: ${error.message}`);
+    }
+  }
+
+  showRateLimitAnalysis(data) {
+    if (data.status === "success") {
+      this.rateLimitExplanationContent.innerHTML = `
+        <div style="margin-bottom: 20px;">
+          <h4 style="color: #065f46; margin-bottom: 10px;">${
+            data.explanation.title
+          }</h4>
+          <p style="margin-bottom: 10px;">${data.explanation.description}</p>
+          <p style="margin-bottom: 15px;"><strong>Practical Meaning:</strong> ${
+            data.explanation.practicalMeaning
+          }</p>
+        </div>
+        
+        <div style="margin-bottom: 20px; padding: 15px; background: white; border-radius: 8px; border: 1px solid #81e6d9;">
+          <h5 style="margin-top: 0; color: #065f46;">📊 Current Rate Limit Status</h5>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; font-size: 0.9rem;">
+            <div><strong>Plan Type:</strong> <span class="plan-type">${
+              data.planType || "Standard Shopify"
+            }</span></div>
+            <div><strong>Leak Rate:</strong> ${
+              data.rateLimit.leakRate
+            } points/second</div>
+            <div><strong>Bucket Capacity:</strong> ${
+              data.rateLimit.bucketCapacity
+            } points</div>
+            <div><strong>Current Usage:</strong> ${
+              data.rateLimit.current
+            } points</div>
+            <div><strong>Available:</strong> ${
+              data.rateLimit.remaining
+            } points</div>
+            <div><strong>Restore Rate:</strong> ${
+              data.rateLimit.restoreRate
+                ? `${data.rateLimit.restoreRate} points/sec`
+                : "Continuous (leaky bucket)"
+            }</div>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 20px; padding: 15px; background: white; border-radius: 8px; border: 1px solid #81e6d9;">
+          <h5 style="margin-top: 0; color: #065f46;">⚡ Performance Analysis</h5>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; font-size: 0.9rem;">
+            <div><strong>Products/Second:</strong> ${
+              data.analysis.productsPerSecond
+            }</div>
+            <div><strong>Products/Minute:</strong> ${
+              data.analysis.productsPerMinute
+            }</div>
+            <div><strong>Products/Hour:</strong> ${
+              data.analysis.productsPerHour
+            }</div>
+            <div><strong>Cost per Product:</strong> ${
+              data.analysis.costPerProduct
+            } points</div>
+            <div><strong>Max Products/Batch:</strong> ${
+              data.analysis.maxProductsPerBatch
+            }</div>
+            <div><strong>Bucket Capacity:</strong> ${
+              data.rateLimit.bucketCapacity
+            } points</div>
+            <div><strong>Restore Rate:</strong> ${
+              data.rateLimit.restoreRate
+                ? `${data.rateLimit.restoreRate} points/sec`
+                : "Continuous"
+            }</div>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 20px; padding: 15px; background: white; border-radius: 8px; border: 1px solid #81e6d9;">
+          <h5 style="margin-top: 0; color: #065f46;">🚀 Time Estimates for Large Operations</h5>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; font-size: 0.9rem;">
+            <div><strong>1,000 Products:</strong> ${
+              data.projections.products1000.timeInMinutes
+            } minutes (${data.projections.products1000.batches} batches)</div>
+            <div><strong>100,000 Products:</strong> ${
+              data.projections.products100k.timeInHours
+            } hours (${data.projections.products100k.batches} batches)</div>
+            <div><strong>1,000,000 Products:</strong> ${
+              data.projections.products1m.timeInHours
+            } hours (${data.projections.products1m.batches} batches)</div>
+            <div><strong>10,000,000 Products:</strong> ${
+              data.projections.products10m.timeInHours
+            } hours (${data.projections.products10m.batches} batches)</div>
+          </div>
+        </div>
+
+        <div style="padding: 15px; background: #f0f9ff; border-radius: 8px; border-left: 4px solid #0ea5e9;">
+          <h5 style="margin-top: 0; color: #0c4a6e;">💡 Recommendations</h5>
+          <ul style="margin: 0; padding-left: 20px; color: #0c4a6e;">
+            ${data.explanation.recommendations
+              .map((rec) => `<li>${rec}</li>`)
+              .join("")}
+          </ul>
+        </div>
+        
+        <div style="margin-top: 15px; padding: 15px; background: #fef3c7; border-radius: 8px; border-left: 4px solid #f59e0b;">
+          <h5 style="margin-top: 0; color: #92400e;">🔍 Cost Analysis Tips</h5>
+          <p style="margin: 0; color: #92400e; font-size: 0.9rem;">
+            <strong>Pro Tip:</strong> Add the header <code>Shopify-GraphQL-Cost-Debug=1</code> to your GraphQL requests to get detailed cost breakdowns. This helps optimize queries by showing exactly how much each field costs.
+          </p>
+        </div>
+            `;
+
+      this.rateLimitExplanation.style.display = "block";
+    } else {
+      alert(`Rate limit analysis failed: ${data.message}`);
+    }
+  }
+
+  showPerformanceProjections(projections) {
+    if (!projections) return;
+
+    // Format time display
+    const formatTime = (seconds) => {
+      if (seconds < 60) return `${seconds.toFixed(1)} seconds`;
+      if (seconds < 3600) return `${(seconds / 60).toFixed(1)} minutes`;
+      return `${(seconds / 3600).toFixed(1)} hours`;
+    };
+
+    // Update projection cards
+    if (this.projection1000) {
+      this.projection1000.innerHTML = `
+        <div><strong>Time:</strong> ${formatTime(
+          projections.products1000.time
+        )}</div>
+        <div><strong>Cost:</strong> ${projections.products1000.cost.toFixed(
+          0
+        )} points</div>
+      `;
+    }
+
+    if (this.projection100k) {
+      this.projection100k.innerHTML = `
+        <div><strong>Time:</strong> ${formatTime(
+          projections.products100k.time
+        )}</div>
+        <div><strong>Cost:</strong> ${projections.products100k.cost.toFixed(
+          0
+        )} points</div>
+      `;
+    }
+
+    if (this.projection1m) {
+      this.projection1m.innerHTML = `
+        <div><strong>Time:</strong> ${formatTime(
+          projections.products1m.time
+        )}</div>
+        <div><strong>Cost:</strong> ${projections.products1m.cost.toFixed(
+          0
+        )} points</div>
+      `;
+    }
+
+    if (this.projection10m) {
+      this.projection10m.innerHTML = `
+        <div><strong>Time:</strong> ${formatTime(
+          projections.products10m.time
+        )}</div>
+        <div><strong>Cost:</strong> ${projections.products10m.cost.toFixed(
+          0
+        )} points</div>
+      `;
+    }
+
+    this.performanceProjections.style.display = "block";
   }
 }
 

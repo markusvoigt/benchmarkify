@@ -14,6 +14,9 @@ app.use(express.static("."));
 // Rate limiting tracking
 const rateLimitStore = new Map();
 
+// Store credentials for reuse
+const storedCredentials = new Map();
+
 // Audit logging system
 const auditLog = {
   sessionId: null,
@@ -30,6 +33,13 @@ const auditLog = {
     peakRateLimitUsage: 0,
     recommendedBatchSize: 10,
     recommendedDelay: 100,
+    totalTime: 0,
+    performanceProjections: {
+      products1000: { time: 0, cost: 0 },
+      products100k: { time: 0, cost: 0 },
+      products1m: { time: 0, cost: 0 },
+      products10m: { time: 0, cost: 0 },
+    },
   },
 };
 
@@ -252,10 +262,45 @@ function createGraphQLClient(storeUrl, accessToken) {
     headers: {
       "X-Shopify-Access-Token": accessToken,
       "Content-Type": "application/json",
+      Accept: "application/json",
     },
   });
 
   return client;
+}
+
+// Calculate optimal batch configuration based on rate limits
+function calculateOptimalBatchConfig(leakRate, costPerProduct = 10) {
+  // Calculate how many products we can process per second
+  const productsPerSecond = Math.floor(leakRate / costPerProduct);
+
+  // Batch size: aim for batches that complete in 1-2 seconds
+  // This allows for some burst capacity while maintaining steady flow
+  const optimalBatchSize = Math.min(
+    Math.max(productsPerSecond * 1.5, 5), // At least 5, up to 1.5x products/second
+    100 // Cap at 100 to avoid overwhelming the API
+  );
+
+  // Delay: ensure we don't exceed the leak rate
+  // With leak rate of X points/second, we need to wait X/costPerProduct seconds between batches
+  const minDelayBetweenBatches = Math.ceil(
+    ((costPerProduct * optimalBatchSize) / leakRate) * 1000
+  );
+
+  // Add some safety margin (20%)
+  const safeDelayBetweenBatches = Math.ceil(minDelayBetweenBatches * 1.2);
+
+  console.log(
+    `Rate limit analysis - Leak rate: ${leakRate} points/sec, Products/sec: ${productsPerSecond}`
+  );
+  console.log(
+    `Optimal batch size: ${optimalBatchSize}, Delay: ${safeDelayBetweenBatches}ms`
+  );
+
+  return {
+    batchSize: Math.floor(optimalBatchSize),
+    delayBetweenBatches: Math.min(safeDelayBetweenBatches, 5000), // Cap at 5 seconds
+  };
 }
 
 // Helper function to handle Shopify rate limits and extract costs
@@ -301,7 +346,8 @@ async function handleGraphQLRequest(
   query,
   variables,
   operationName,
-  storeUrl = null
+  storeUrl = null,
+  accessToken = null
 ) {
   const startTime = Date.now();
 
@@ -309,22 +355,103 @@ async function handleGraphQLRequest(
     console.log(`Making GraphQL request: ${operationName}`);
     console.log(`Variables:`, JSON.stringify(variables, null, 2));
 
-    const response = await client.request(query, variables);
+    // Use direct fetch approach matching Shopify documentation
+    const requestHeaders = {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": accessToken,
+      Accept: "application/json",
+    };
+
+    console.log("Request headers:", requestHeaders);
+    console.log("Request URL:", client.url);
+
+    const response = await fetch(client.url, {
+      method: "POST",
+      headers: requestHeaders,
+      body: JSON.stringify({
+        query,
+        variables,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const responseData = await response.json();
     const responseTime = (Date.now() - startTime) / 1000;
 
     console.log(
       `GraphQL response for ${operationName}:`,
-      JSON.stringify(response, null, 2)
+      JSON.stringify(responseData, null, 2)
     );
 
-    // Extract rate limit info from response headers
-    const rateLimitInfo = {
+    // Check for GraphQL errors in the response
+    if (responseData.errors) {
+      throw new Error(`GraphQL errors: ${JSON.stringify(responseData.errors)}`);
+    }
+
+    // Extract rate limit info from response headers and extensions
+    let rateLimitInfo = {
       current: 0,
-      limit: 1000, // Default Shopify limit
-      remaining: 1000,
+      limit: 100, // Default Shopify limit (100 points/second)
+      remaining: 100,
       resetTime: null,
       cost: QUERY_COSTS[operationName] || 0,
     };
+
+    // Extract rate limit headers from successful response
+    const headers = response.headers;
+    const limitHeader = headers.get("x-shopify-shop-api-call-limit");
+    const costHeader = headers.get("x-shopify-graphql-query-cost");
+
+    console.log("Rate limit headers found:", {
+      limitHeader: limitHeader,
+      costHeader: costHeader,
+      allHeaders: Object.fromEntries(headers.entries()),
+    });
+
+    // Check GraphQL response extensions for rate limit info (most reliable)
+    if (responseData.extensions?.cost?.throttleStatus) {
+      const throttleStatus = responseData.extensions.cost.throttleStatus;
+      console.log("Rate limit info from GraphQL extensions:", throttleStatus);
+
+      // The restoreRate is the actual leak rate (points per second)
+      const leakRate = throttleStatus.restoreRate;
+
+      rateLimitInfo = {
+        current:
+          throttleStatus.maximumAvailable - throttleStatus.currentlyAvailable,
+        limit: throttleStatus.maximumAvailable, // Total bucket capacity
+        remaining: throttleStatus.currentlyAvailable, // Available points
+        restoreRate: throttleStatus.restoreRate, // Points restored per second (leak rate)
+        leakRate: leakRate, // Same as restoreRate for clarity
+        resetTime: "Continuous (leaky bucket)",
+        cost:
+          responseData.extensions.cost.actualQueryCost ||
+          QUERY_COSTS[operationName] ||
+          0,
+      };
+
+      console.log("Parsed rate limit info from extensions:", rateLimitInfo);
+    }
+    // Fall back to headers if extensions not available
+    else if (limitHeader) {
+      const [current, limit] = limitHeader.split("/").map(Number);
+      rateLimitInfo = {
+        current,
+        limit,
+        remaining: limit - current,
+        resetTime:
+          headers.get("x-shopify-shop-api-call-limit-reset") ||
+          "Continuous (leaky bucket)",
+        cost: costHeader
+          ? parseInt(costHeader)
+          : QUERY_COSTS[operationName] || 0,
+      };
+    }
+
+    console.log("Final rate limit info:", rateLimitInfo);
 
     // Log successful operation
     logOperation({
@@ -332,8 +459,8 @@ async function handleGraphQLRequest(
       success: true,
       responseTime: responseTime * 1000, // Convert to ms
       cost: rateLimitInfo.cost,
-      productId: extractProductId(response, operationName),
-      summary: generateOperationSummary(operationName, response, true),
+      productId: extractProductId(responseData, operationName),
+      summary: generateOperationSummary(operationName, responseData, true),
       rateLimit: rateLimitInfo,
     });
 
@@ -352,7 +479,7 @@ async function handleGraphQLRequest(
       success: true,
       responseTime,
       rateLimit: rateLimitInfo,
-      data: response,
+      data: responseData,
       cost: rateLimitInfo.cost,
     };
   } catch (error) {
@@ -481,7 +608,9 @@ app.post("/api/test-graphql", async (req, res) => {
       client,
       testQuery,
       {},
-      "testConnection"
+      "testConnection",
+      storeUrl,
+      accessToken
     );
 
     if (result.success) {
@@ -538,7 +667,9 @@ app.post("/api/test-product-create", async (req, res) => {
       client,
       GRAPHQL_QUERIES.createProduct,
       { product: minimalProduct },
-      "testProductCreate"
+      "testProductCreate",
+      storeUrl,
+      accessToken
     );
 
     if (result.success) {
@@ -597,7 +728,9 @@ app.post("/api/schema-info", async (req, res) => {
       client,
       introspectionQuery,
       {},
-      "schemaIntrospection"
+      "schemaIntrospection",
+      storeUrl,
+      accessToken
     );
 
     if (result.success) {
@@ -630,16 +763,221 @@ app.post("/api/schema-info", async (req, res) => {
   }
 });
 
+// Store credentials endpoint
+app.post("/api/store-credentials", (req, res) => {
+  try {
+    const { storeUrl, accessToken, sessionId } = req.body;
+
+    if (!storeUrl || !accessToken) {
+      return res.status(400).json({
+        error: "Missing store URL or access token",
+      });
+    }
+
+    const sessionKey = sessionId || generateBenchmarkTag();
+    storedCredentials.set(sessionKey, {
+      storeUrl,
+      accessToken,
+      timestamp: Date.now(),
+      sessionId: sessionKey,
+    });
+
+    // Clean up old credentials (older than 24 hours)
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [key, value] of storedCredentials.entries()) {
+      if (value.timestamp < oneDayAgo) {
+        storedCredentials.delete(key);
+      }
+    }
+
+    res.json({
+      status: "success",
+      message: "Credentials stored successfully",
+      sessionId: sessionKey,
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+    });
+  } catch (error) {
+    console.error("Store credentials error:", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
+});
+
+// Get stored credentials endpoint
+app.get("/api/stored-credentials/:sessionId", (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const credentials = storedCredentials.get(sessionId);
+
+    if (!credentials) {
+      return res.status(404).json({
+        error: "Credentials not found or expired",
+      });
+    }
+
+    // Check if credentials are expired (24 hours)
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    if (credentials.timestamp < oneDayAgo) {
+      storedCredentials.delete(sessionId);
+      return res.status(404).json({
+        error: "Credentials expired",
+      });
+    }
+
+    res.json({
+      status: "success",
+      storeUrl: credentials.storeUrl,
+      sessionId: credentials.sessionId,
+      expiresAt: new Date(
+        credentials.timestamp + 24 * 60 * 60 * 1000
+      ).toISOString(),
+    });
+  } catch (error) {
+    console.error("Get stored credentials error:", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
+});
+
+// Rate limit analysis endpoint
+app.post("/api/rate-limit-analysis", async (req, res) => {
+  try {
+    const { storeUrl, accessToken } = req.body;
+
+    if (!storeUrl || !accessToken) {
+      return res.status(400).json({
+        error: "Missing store URL or access token",
+      });
+    }
+
+    console.log("Analyzing rate limits for store...");
+
+    const client = createGraphQLClient(storeUrl, accessToken);
+
+    // Test with a simple query to get rate limit info
+    const testQuery = `
+      query {
+        shop {
+          name
+          id
+        }
+      }
+    `;
+
+    const result = await handleGraphQLRequest(
+      client,
+      testQuery,
+      {},
+      "rateLimitAnalysis",
+      storeUrl,
+      accessToken
+    );
+
+    if (!result.success) {
+      return res.json({
+        status: "error",
+        message: "Failed to analyze rate limits",
+        error: result.error,
+      });
+    }
+
+    const rateLimit = result.rateLimit;
+
+    // Use the leak rate (restoreRate) for calculations, not the bucket capacity
+    const leakRate = rateLimit.leakRate || rateLimit.restoreRate || 100; // Default to Standard Shopify
+    const bucketCapacity = rateLimit.limit || 1000; // Total bucket capacity
+
+    console.log(
+      "Rate limit analysis - using leak rate:",
+      leakRate,
+      "bucket capacity:",
+      bucketCapacity
+    );
+
+    // Determine Shopify plan based on leak rate (points per second)
+    let planType = "Standard Shopify";
+    if (leakRate >= 2000) planType = "Shopify for Enterprise";
+    else if (leakRate >= 1000) planType = "Shopify Plus";
+    else if (leakRate >= 200) planType = "Advanced Shopify";
+
+    const costPerProduct = 10; // Standard cost for product operations
+    const productsPerSecond = Math.floor(leakRate / costPerProduct);
+    const productsPerMinute = productsPerSecond * 60;
+    const productsPerHour = productsPerMinute * 60;
+
+    // Calculate time estimates for different product counts
+    const calculateTimeEstimate = (productCount) => {
+      const totalCost = productCount * costPerProduct;
+      // With leak rate (points/second), we can calculate time more accurately
+      const timeInSeconds = totalCost / leakRate; // points / (points/second) = seconds
+      return {
+        timeInSeconds,
+        timeInMinutes: Math.ceil(timeInSeconds / 60),
+        timeInHours: Math.ceil(timeInSeconds / 3600),
+        batches: Math.ceil(totalCost / leakRate), // For display purposes
+        totalCost,
+      };
+    };
+
+    const projections = {
+      products1000: calculateTimeEstimate(1000),
+      products100k: calculateTimeEstimate(100000),
+      products1m: calculateTimeEstimate(1000000),
+      products10m: calculateTimeEstimate(10000000),
+    };
+
+    const responseData = {
+      status: "success",
+      rateLimit: {
+        leakRate: leakRate, // Points per second (leak rate)
+        bucketCapacity: bucketCapacity, // Total bucket capacity
+        current: rateLimit.current || 0,
+        remaining: rateLimit.remaining || bucketCapacity,
+        restoreRate: rateLimit.restoreRate,
+        resetTime: rateLimit.resetTime,
+      },
+      analysis: {
+        productsPerSecond,
+        productsPerMinute,
+        productsPerHour,
+        costPerProduct,
+        maxProductsPerBatch: Math.floor(leakRate / costPerProduct),
+      },
+      projections,
+      planType: planType, // Add plan type directly to response
+      explanation: {
+        title: "Understanding Your API Rate Limits",
+        description: `Your store appears to be on the ${planType} plan with a leak rate of ${leakRate} calculated query points per second. Each product operation (create/update/delete) costs ${costPerProduct} points.`,
+        practicalMeaning: `This means you can perform approximately ${productsPerSecond} product operations per second, ${productsPerMinute} per minute, or ${productsPerHour} per hour through a single API client.`,
+        recommendations: [
+          "Use batch operations to maximize efficiency",
+          "Implement exponential backoff when hitting rate limits",
+          "Consider using multiple API clients for high-volume operations",
+          "Monitor rate limit usage during operations",
+          "Use the Shopify-GraphQL-Cost-Debug=1 header to analyze query costs",
+          `Consider upgrading to a higher plan if you need more throughput (current: ${planType})`,
+        ],
+      },
+    };
+
+    res.json(responseData);
+  } catch (error) {
+    console.error("Rate limit analysis error:", error);
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
+});
+
 // Benchmark endpoint for product creation
 app.post("/api/benchmark/create", async (req, res) => {
   try {
-    const {
-      storeUrl,
-      accessToken,
-      count = 5,
-      batchSize = 10,
-      delayBetweenBatches = 100,
-    } = req.body;
+    const { storeUrl, accessToken, count = 5 } = req.body;
 
     if (!storeUrl || !accessToken) {
       return res.status(400).json({
@@ -649,13 +987,32 @@ app.post("/api/benchmark/create", async (req, res) => {
 
     console.log(`Starting GraphQL product creation benchmark...`);
     console.log(`🔒 Using benchmark tag: ${SESSION_BENCHMARK_TAG}`);
+
+    // Get current rate limits to calculate optimal batch configuration
+    const rateLimitResult = await handleGraphQLRequest(
+      client,
+      `query { shop { name id } }`,
+      {},
+      "rateLimitCheck",
+      storeUrl,
+      accessToken
+    );
+
+    const leakRate =
+      rateLimitResult.rateLimit?.leakRate ||
+      rateLimitResult.rateLimit?.restoreRate ||
+      100;
+    const { batchSize, delayBetweenBatches } =
+      calculateOptimalBatchConfig(leakRate);
+
     console.log(
-      `📊 Creating ${count} products in batches of ${batchSize} with ${delayBetweenBatches}ms delay`
+      `📊 Creating ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
     );
 
     const client = createGraphQLClient(storeUrl, accessToken);
     const results = [];
-    const numProducts = Math.min(Math.max(1, count), 10000); // Ensure count is between 1-10000
+    const numProducts = Math.min(Math.max(1, count), 1000000); // Support up to 1 million products
+    const startTime = Date.now();
 
     // Process in batches with adaptive rate limiting
     for (
@@ -682,7 +1039,8 @@ app.post("/api/benchmark/create", async (req, res) => {
             GRAPHQL_QUERIES.createProduct,
             { product: productData },
             "createProduct",
-            storeUrl
+            storeUrl,
+            accessToken
           ).catch((error) => ({
             success: false,
             error: error.message,
@@ -733,6 +1091,8 @@ app.post("/api/benchmark/create", async (req, res) => {
       }
     }
 
+    const totalTime = (Date.now() - startTime) / 1000; // Convert to seconds
+
     // Calculate metrics
     const successfulResults = results.filter((r) => r.success);
     const avgResponseTime =
@@ -758,30 +1118,57 @@ app.post("/api/benchmark/create", async (req, res) => {
           ).toFixed(2)
         : 0;
 
+    // Calculate performance projections
+    const calculateProjection = (productCount) => {
+      const estimatedCost = productCount * avgCost;
+      const estimatedTime = estimatedCost / (totalCost / totalTime);
+      return {
+        time: estimatedTime,
+        cost: estimatedCost,
+      };
+    };
+
+    const performanceProjections = {
+      products1000: calculateProjection(1000),
+      products100k: calculateProjection(100000),
+      products1m: calculateProjection(1000000),
+      products10m: calculateProjection(10000000),
+    };
+
+    // Update audit log with performance data
+    auditLog.summary.totalTime = totalTime;
+    auditLog.summary.performanceProjections = performanceProjections;
+
     res.json({
       status: successCount > 0 ? "success" : "error",
       responseTime: avgResponseTime,
+      totalTime: totalTime.toFixed(2),
       rateLimit: results[results.length - 1]?.rateLimit || {
         current: 0,
         limit: 1000,
         remaining: 1000,
       },
-      details: `Created ${successCount}/${totalCount} products successfully. Avg response time: ${avgResponseTime}s`,
+      details: `Created ${successCount}/${totalCount} products successfully. Total time: ${totalTime.toFixed(
+        2
+      )}s`,
       cost: {
         total: totalCost,
         average: avgCost,
         perSecond: costPerSecond,
         productsPerSecond: (1000 / avgCost).toFixed(2), // Theoretical max based on cost
       },
+      performanceProjections,
     });
   } catch (error) {
     console.error("Product creation benchmark error:", error);
     res.status(500).json({
       status: "error",
       responseTime: 0,
+      totalTime: 0,
       rateLimit: { current: 0, limit: 1000, remaining: 1000 },
       details: error.message,
       cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+      performanceProjections: {},
     });
   }
 });
@@ -789,13 +1176,7 @@ app.post("/api/benchmark/create", async (req, res) => {
 // Benchmark endpoint for product updates
 app.post("/api/benchmark/update", async (req, res) => {
   try {
-    const {
-      storeUrl,
-      accessToken,
-      count = 3,
-      batchSize = 10,
-      delayBetweenBatches = 100,
-    } = req.body;
+    const { storeUrl, accessToken, count = 3 } = req.body;
 
     if (!storeUrl || !accessToken) {
       return res.status(400).json({
@@ -805,7 +1186,27 @@ app.post("/api/benchmark/update", async (req, res) => {
 
     console.log("Starting GraphQL product update benchmark...");
     console.log(`🔒 Looking for products with tag: ${SESSION_BENCHMARK_TAG}`);
-    console.log(`📊 Updating ${count} products...`);
+
+    // Get current rate limits to calculate optimal batch configuration
+    const rateLimitResult = await handleGraphQLRequest(
+      client,
+      `query { shop { name id } }`,
+      {},
+      "rateLimitCheck",
+      storeUrl,
+      accessToken
+    );
+
+    const leakRate =
+      rateLimitResult.rateLimit?.leakRate ||
+      rateLimitResult.rateLimit?.restoreRate ||
+      100;
+    const { batchSize, delayBetweenBatches } =
+      calculateOptimalBatchConfig(leakRate);
+
+    console.log(
+      `📊 Updating ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
+    );
 
     const client = createGraphQLClient(storeUrl, accessToken);
 
@@ -813,9 +1214,10 @@ app.post("/api/benchmark/update", async (req, res) => {
     const productsResponse = await handleGraphQLRequest(
       client,
       GRAPHQL_QUERIES.getProducts,
-      { first: 50 }, // Get more products to find benchmark ones
+      { first: 250 }, // Get more products to find benchmark ones
       "getProducts",
-      storeUrl
+      storeUrl,
+      accessToken
     );
 
     if (
@@ -825,9 +1227,11 @@ app.post("/api/benchmark/update", async (req, res) => {
       return res.json({
         status: "error",
         responseTime: 0,
+        totalTime: 0,
         rateLimit: { current: 0, limit: 1000, remaining: 1000 },
         details: "No products found to update",
         cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+        performanceProjections: {},
       });
     }
 
@@ -844,9 +1248,11 @@ app.post("/api/benchmark/update", async (req, res) => {
       return res.json({
         status: "error",
         responseTime: 0,
+        totalTime: 0,
         rateLimit: { current: 0, limit: 1000, remaining: 1000 },
         details: `No benchmark products found with tag: ${SESSION_BENCHMARK_TAG}`,
         cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+        performanceProjections: {},
       });
     }
 
@@ -858,7 +1264,11 @@ app.post("/api/benchmark/update", async (req, res) => {
     const results = [];
 
     // Update products in batches with adaptive rate limiting
-    const updateCount = Math.min(Math.max(1, count), products.length);
+    const updateCount = Math.min(
+      Math.max(1, count),
+      Math.min(products.length, 1000000)
+    ); // Support up to 1 million products
+    const startTime = Date.now();
 
     for (
       let batchStart = 0;
@@ -891,7 +1301,8 @@ app.post("/api/benchmark/update", async (req, res) => {
             GRAPHQL_QUERIES.updateProduct,
             { input: updateData },
             "updateProduct",
-            storeUrl
+            storeUrl,
+            accessToken
           ).catch((error) => ({
             success: false,
             error: error.message,
@@ -958,6 +1369,8 @@ app.post("/api/benchmark/update", async (req, res) => {
     const successCount = successfulResults.length;
     const totalCount = results.length;
 
+    const totalTime = (Date.now() - startTime) / 1000; // Convert to seconds
+
     const costPerSecond =
       successfulResults.length > 0
         ? (
@@ -966,30 +1379,53 @@ app.post("/api/benchmark/update", async (req, res) => {
           ).toFixed(2)
         : 0;
 
+    // Calculate performance projections
+    const calculateProjection = (productCount) => {
+      const estimatedCost = productCount * avgCost;
+      const estimatedTime = estimatedCost / (totalCost / totalTime);
+      return {
+        time: estimatedTime,
+        cost: estimatedCost,
+      };
+    };
+
+    const performanceProjections = {
+      products1000: calculateProjection(1000),
+      products100k: calculateProjection(100000),
+      products1m: calculateProjection(1000000),
+      products10m: calculateProjection(10000000),
+    };
+
     res.json({
       status: successCount > 0 ? "success" : "error",
       responseTime: avgResponseTime,
+      totalTime: totalTime.toFixed(2),
       rateLimit: results[results.length - 1]?.rateLimit || {
         current: 0,
         limit: 1000,
         remaining: 1000,
       },
-      details: `Updated ${successCount}/${totalCount} products successfully. Avg response time: ${avgResponseTime}s`,
+      details: `Updated ${successCount}/${totalCount} products successfully. Total time: ${totalTime.toFixed(
+        2
+      )}s`,
       cost: {
         total: totalCost,
         average: avgCost,
         perSecond: costPerSecond,
         productsPerSecond: (1000 / avgCost).toFixed(2),
       },
+      performanceProjections,
     });
   } catch (error) {
     console.error("Product update benchmark error:", error);
     res.status(500).json({
       status: "error",
       responseTime: 0,
+      totalTime: 0,
       rateLimit: { current: 0, limit: 1000, remaining: 1000 },
       details: error.message,
       cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+      performanceProjections: {},
     });
   }
 });
@@ -997,13 +1433,7 @@ app.post("/api/benchmark/update", async (req, res) => {
 // Benchmark endpoint for product deletion
 app.post("/api/benchmark/delete", async (req, res) => {
   try {
-    const {
-      storeUrl,
-      accessToken,
-      count = 3,
-      batchSize = 10,
-      delayBetweenBatches = 100,
-    } = req.body;
+    const { storeUrl, accessToken, count = 3 } = req.body;
 
     if (!storeUrl || !accessToken) {
       return res.status(400).json({
@@ -1013,7 +1443,27 @@ app.post("/api/benchmark/delete", async (req, res) => {
 
     console.log("Starting GraphQL product deletion benchmark...");
     console.log(`🔒 Looking for products with tag: ${SESSION_BENCHMARK_TAG}`);
-    console.log(`📊 Deleting ${count} products...`);
+
+    // Get current rate limits to calculate optimal batch configuration
+    const rateLimitResult = await handleGraphQLRequest(
+      client,
+      `query { shop { name id } }`,
+      {},
+      "rateLimitCheck",
+      storeUrl,
+      accessToken
+    );
+
+    const leakRate =
+      rateLimitResult.rateLimit?.leakRate ||
+      rateLimitResult.rateLimit?.restoreRate ||
+      100;
+    const { batchSize, delayBetweenBatches } =
+      calculateOptimalBatchConfig(leakRate);
+
+    console.log(
+      `📊 Deleting ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
+    );
 
     const client = createGraphQLClient(storeUrl, accessToken);
 
@@ -1021,9 +1471,10 @@ app.post("/api/benchmark/delete", async (req, res) => {
     const productsResponse = await handleGraphQLRequest(
       client,
       GRAPHQL_QUERIES.getProducts,
-      { first: 100 }, // Get more products to find benchmark ones
+      { first: 250 }, // Get more products to find benchmark ones
       "getProducts",
-      storeUrl
+      storeUrl,
+      accessToken
     );
 
     if (
@@ -1033,9 +1484,11 @@ app.post("/api/benchmark/delete", async (req, res) => {
       return res.json({
         status: "error",
         responseTime: 0,
+        totalTime: 0,
         rateLimit: { current: 0, limit: 1000, remaining: 1000 },
         details: "No products found to delete",
         cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+        performanceProjections: {},
       });
     }
 
@@ -1052,9 +1505,11 @@ app.post("/api/benchmark/delete", async (req, res) => {
       return res.json({
         status: "error",
         responseTime: 0,
+        totalTime: 0,
         rateLimit: { current: 0, limit: 1000, remaining: 1000 },
         details: `No benchmark products found with tag: ${SESSION_BENCHMARK_TAG}`,
         cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+        performanceProjections: {},
       });
     }
 
@@ -1066,7 +1521,11 @@ app.post("/api/benchmark/delete", async (req, res) => {
     const results = [];
 
     // Delete products in batches with adaptive rate limiting
-    const deleteCount = Math.min(Math.max(1, count), products.length);
+    const deleteCount = Math.min(
+      Math.max(1, count),
+      Math.min(products.length, 1000000)
+    ); // Support up to 1 million products
+    const startTime = Date.now();
 
     for (
       let batchStart = 0;
@@ -1092,7 +1551,8 @@ app.post("/api/benchmark/delete", async (req, res) => {
             GRAPHQL_QUERIES.deleteProduct,
             { input: { id: product.id } },
             "deleteProduct",
-            storeUrl
+            storeUrl,
+            accessToken
           ).catch((error) => ({
             success: false,
             error: error.message,
@@ -1159,6 +1619,8 @@ app.post("/api/benchmark/delete", async (req, res) => {
     const successCount = successfulResults.length;
     const totalCount = results.length;
 
+    const totalTime = (Date.now() - startTime) / 1000; // Convert to seconds
+
     const costPerSecond =
       successfulResults.length > 0
         ? (
@@ -1167,30 +1629,53 @@ app.post("/api/benchmark/delete", async (req, res) => {
           ).toFixed(2)
         : 0;
 
+    // Calculate performance projections
+    const calculateProjection = (productCount) => {
+      const estimatedCost = productCount * avgCost;
+      const estimatedTime = estimatedCost / (totalCost / totalTime);
+      return {
+        time: estimatedTime,
+        cost: estimatedCost,
+      };
+    };
+
+    const performanceProjections = {
+      products1000: calculateProjection(1000),
+      products100k: calculateProjection(100000),
+      products1m: calculateProjection(1000000),
+      products10m: calculateProjection(10000000),
+    };
+
     res.json({
       status: successCount > 0 ? "success" : "error",
       responseTime: avgResponseTime,
+      totalTime: totalTime.toFixed(2),
       rateLimit: results[results.length - 1]?.rateLimit || {
         current: 0,
         limit: 1000,
         remaining: 1000,
       },
-      details: `Deleted ${successCount}/${totalCount} products successfully. Avg response time: ${avgResponseTime}s`,
+      details: `Deleted ${successCount}/${totalCount} products successfully. Total time: ${totalTime.toFixed(
+        2
+      )}s`,
       cost: {
         total: totalCost,
         average: avgCost,
         perSecond: costPerSecond,
         productsPerSecond: (1000 / avgCost).toFixed(2),
       },
+      performanceProjections,
     });
   } catch (error) {
     console.error("Product deletion benchmark error:", error);
     res.status(500).json({
       status: "error",
       responseTime: 0,
+      totalTime: 0,
       rateLimit: { current: 0, limit: 1000, remaining: 1000 },
       details: error.message,
       cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+      performanceProjections: {},
     });
   }
 });
@@ -1279,7 +1764,9 @@ app.post("/api/cleanup-benchmark", async (req, res) => {
           client,
           GRAPHQL_QUERIES.deleteProduct,
           { input: { id: product.id } },
-          "cleanupDelete"
+          "cleanupDelete",
+          storeUrl,
+          accessToken
         );
 
         results.push(result);
