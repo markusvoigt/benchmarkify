@@ -417,6 +417,7 @@ class Benchmarkify {
       deleteCount,
       batchSize,
       delayBetweenBatches,
+      delayBetweenOperations: 3, // 3 second delay between operations
     });
   }
 
@@ -449,6 +450,20 @@ class Benchmarkify {
         );
         progress += progressPerOperation;
         this.updateProgress(progress);
+
+        // Add delay after creation to ensure products are indexed
+        if (config.deleteCount > 0 || config.updateCount > 0) {
+          const delaySeconds = config.delayBetweenOperations || 8; // Increased from 3 to 8 seconds
+          console.log(
+            `⏳ Waiting ${delaySeconds} seconds for products to be indexed...`
+          );
+          this.updateStatus(
+            `Waiting ${delaySeconds} seconds for products to be indexed...`
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, delaySeconds * 1000)
+          );
+        }
       }
 
       // Start product update benchmark if enabled
@@ -461,6 +476,20 @@ class Benchmarkify {
         );
         progress += progressPerOperation;
         this.updateProgress(progress);
+
+        // Add delay after updates if delete is next
+        if (config.deleteCount > 0) {
+          const delaySeconds = config.delayBetweenOperations || 2;
+          console.log(
+            `⏳ Waiting ${delaySeconds} seconds for updates to be indexed...`
+          );
+          this.updateStatus(
+            `Waiting ${delaySeconds} seconds for updates to be indexed...`
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, delaySeconds * 1000)
+          );
+        }
       }
 
       // Start product deletion benchmark if enabled
@@ -564,6 +593,9 @@ class Benchmarkify {
         cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
         details: error.message,
       });
+      this.showDetailedError("Product Creation Failed", {
+        message: error.message,
+      });
     }
   }
 
@@ -597,6 +629,9 @@ class Benchmarkify {
         cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
         details: error.message,
       });
+      this.showDetailedError("Product Update Failed", {
+        message: error.message,
+      });
     }
   }
 
@@ -626,9 +661,13 @@ class Benchmarkify {
       this.updateResultRow("delete-row", {
         status: "error",
         responseTime: "-",
+        error,
         rateLimit: { current: 0, limit: 1000, remaining: 1000 },
         cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
         details: error.message,
+      });
+      this.showDetailedError("Product Deletion Failed", {
+        message: error.message,
       });
     }
   }
@@ -732,7 +771,15 @@ class Benchmarkify {
     this.currentUsage.textContent = currentUsage;
     this.remainingCalls.textContent = limit - currentUsage;
     this.totalCost.textContent = totalCost;
-    this.maxProductsPerSecond.textContent = maxProductsPerSecond.toFixed(2);
+
+    // Use the actual calculated products per second from rate limit analysis
+    // If we have rate limit data from analysis, use that; otherwise fall back to benchmark results
+    if (this.latestRateLimitData && this.latestRateLimitData.analysis) {
+      this.maxProductsPerSecond.textContent =
+        this.latestRateLimitData.analysis.productsPerSecond.toFixed(2);
+    } else {
+      this.maxProductsPerSecond.textContent = maxProductsPerSecond.toFixed(2);
+    }
 
     this.rateLimitInfo.style.display = "block";
   }
@@ -1213,6 +1260,9 @@ class Benchmarkify {
 
   showRateLimitAnalysis(data) {
     if (data.status === "success") {
+      // Store the rate limit data for use in other parts of the UI
+      this.latestRateLimitData = data;
+
       this.rateLimitExplanationContent.innerHTML = `
         <div style="margin-bottom: 20px;">
           <h4 style="color: #065f46; margin-bottom: 10px;">${
@@ -1283,17 +1333,81 @@ class Benchmarkify {
           <h5 style="margin-top: 0; color: #065f46;">🚀 Time Estimates for Large Operations</h5>
           <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; font-size: 0.9rem;">
             <div><strong>1,000 Products:</strong> ${
-              data.projections.products1000.timeInMinutes
-            } minutes (${data.projections.products1000.batches} batches)</div>
+              data.projections.products1000.timeDisplay
+            } ${data.projections.products1000.timeUnit} (${
+        data.projections.products1000.batches
+      } batches of ${data.projections.products1000.batchSize})</div>
             <div><strong>100,000 Products:</strong> ${
-              data.projections.products100k.timeInHours
-            } hours (${data.projections.products100k.batches} batches)</div>
+              data.projections.products100k.timeDisplay
+            } ${data.projections.products100k.timeUnit} (${
+        data.projections.products100k.batches
+      } batches of ${data.projections.products100k.batchSize})</div>
             <div><strong>1,000,000 Products:</strong> ${
-              data.projections.products1m.timeInHours
-            } hours (${data.projections.products1m.batches} batches)</div>
+              data.projections.products1m.timeDisplay
+            } ${data.projections.products1m.timeUnit} (${
+        data.projections.products1m.batches
+      } batches of ${data.projections.products1m.batchSize})</div>
             <div><strong>10,000,000 Products:</strong> ${
-              data.projections.products10m.timeInHours
-            } hours (${data.projections.products10m.batches} batches)</div>
+              data.projections.products10m.timeDisplay
+            } ${data.projections.products10m.timeUnit} (${
+        data.projections.products10m.batches
+      } batches of ${data.projections.products10m.batchSize})</div>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 20px; padding: 15px; background: #f0f9ff; border-radius: 8px; border-left: 4px solid #0ea5e9;">
+          <h5 style="margin-top: 0; color: #0c4a6e;">📊 Time Calculation Breakdown</h5>
+          <div style="font-size: 0.9rem; color: #0c4a6e;">
+            <p style="margin-bottom: 10px;"><strong>How time is calculated:</strong></p>
+            <ul style="margin: 0; padding-left: 20px;">
+              <li><strong>Processing Time:</strong> Total points ÷ Leak rate = Pure API processing time</li>
+              <li><strong>Batch Delays:</strong> (Number of batches - 1) × Delay between batches</li>
+              <li><strong>Total Time:</strong> Processing time + Batch delays</li>
+            </ul>
+            <p style="margin-top: 10px; font-size: 0.85rem;">
+              <strong>Example for 100,000 products:</strong> 1,000,000 points ÷ 2,000 points/sec = 500 seconds processing + batch delays = more accurate total time
+            </p>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 20px; padding: 15px; background: white; border-radius: 8px; border: 1px solid #81e6d9;">
+          <h5 style="margin-top: 0; color: #065f46;">🔧 Current Configuration (Aggressive Mode)</h5>
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; font-size: 0.9rem;">
+            <div><strong>Leak Rate:</strong> ${
+              data.explanation.timeCalculationDetails?.leakRate || "N/A"
+            } points/second</div>
+            <div><strong>Cost per Product:</strong> ${
+              data.explanation.timeCalculationDetails?.costPerProduct || "N/A"
+            } points</div>
+            <div><strong>Products per Second:</strong> ${
+              data.explanation.timeCalculationDetails?.productsPerSecond ||
+              "N/A"
+            }</div>
+            <div><strong>Optimization Mode:</strong> <span style="color: #dc2626; font-weight: bold;">${
+              data.explanation.timeCalculationDetails?.optimizationMode || "N/A"
+            }</span></div>
+            <div><strong>Optimal Batch Size:</strong> ${
+              data.explanation.timeCalculationDetails?.batchSize || "N/A"
+            } products</div>
+            <div><strong>Delay Between Batches:</strong> ${
+              data.explanation.timeCalculationDetails?.delayBetweenBatches ||
+              "N/A"
+            } ms</div>
+          </div>
+        </div>
+
+        <div style="margin-bottom: 20px; padding: 15px; background: #fef3c7; border-radius: 8px; border-left: 4px solid #f59e0b;">
+          <h5 style="margin-top: 0; color: #92400e;">⚡ Optimization Strategies</h5>
+          <div style="font-size: 0.9rem; color: #92400e;">
+            <p style="margin-bottom: 10px;"><strong>Current Mode: Aggressive</strong></p>
+            <ul style="margin: 0; padding-left: 20px;">
+              <li><strong>Aggressive:</strong> Maximum throughput (90% bucket usage, 2% safety margin)</li>
+              <li><strong>Balanced:</strong> Good throughput with safety (70% bucket usage, 10% safety margin)</li>
+              <li><strong>Conservative:</strong> Safe and steady (50% bucket usage, 20% safety margin)</li>
+            </ul>
+            <p style="margin-top: 10px; font-size: 0.85rem;">
+              <strong>💡 Tip:</strong> Aggressive mode maximizes throughput but may occasionally hit rate limits. The system will automatically retry with exponential backoff if needed.
+            </p>
           </div>
         </div>
 
@@ -1315,16 +1429,51 @@ class Benchmarkify {
             `;
 
       this.rateLimitExplanation.style.display = "block";
+
+      // Update the rate limit info display with the actual calculated values
+      this.updateRateLimitDisplay(data);
     } else {
       alert(`Rate limit analysis failed: ${data.message}`);
+    }
+  }
+
+  // Update rate limit display with actual calculated values
+  updateRateLimitDisplay(data) {
+    if (data.analysis && data.analysis.productsPerSecond) {
+      this.maxProductsPerSecond.textContent =
+        data.analysis.productsPerSecond.toFixed(2);
+
+      // Also update other rate limit info if available
+      if (data.rateLimit) {
+        this.currentUsage.textContent = data.rateLimit.current || 0;
+        this.remainingCalls.textContent = data.rateLimit.remaining || 0;
+      }
+
+      // Show the rate limit info section
+      this.rateLimitInfo.style.display = "block";
+    }
+  }
+
+  // Helper function to show more informative error messages
+  showDetailedError(title, data) {
+    if (data.details && data.details.includes("fallback strategies")) {
+      const message = `${title}\n\n${data.details}\n\n💡 Tip: Try creating some products first, or the system will automatically find existing products to work with.`;
+      alert(message);
+    } else {
+      alert(`${title}: ${data.details || data.message || "Unknown error"}`);
     }
   }
 
   showPerformanceProjections(projections) {
     if (!projections) return;
 
-    // Format time display
-    const formatTime = (seconds) => {
+    // Use the new timeDisplay and timeUnit from backend if available
+    const formatTime = (projection) => {
+      if (projection.timeDisplay && projection.timeUnit) {
+        return `${projection.timeDisplay} ${projection.timeUnit}`;
+      }
+      // Fallback to old format if new fields aren't available
+      const seconds = projection.time || 0;
       if (seconds < 60) return `${seconds.toFixed(1)} seconds`;
       if (seconds < 3600) return `${(seconds / 60).toFixed(1)} minutes`;
       return `${(seconds / 3600).toFixed(1)} hours`;
@@ -1334,7 +1483,7 @@ class Benchmarkify {
     if (this.projection1000) {
       this.projection1000.innerHTML = `
         <div><strong>Time:</strong> ${formatTime(
-          projections.products1000.time
+          projections.products1000
         )}</div>
         <div><strong>Cost:</strong> ${projections.products1000.cost.toFixed(
           0
@@ -1345,7 +1494,7 @@ class Benchmarkify {
     if (this.projection100k) {
       this.projection100k.innerHTML = `
         <div><strong>Time:</strong> ${formatTime(
-          projections.products100k.time
+          projections.products100k
         )}</div>
         <div><strong>Cost:</strong> ${projections.products100k.cost.toFixed(
           0
@@ -1355,9 +1504,7 @@ class Benchmarkify {
 
     if (this.projection1m) {
       this.projection1m.innerHTML = `
-        <div><strong>Time:</strong> ${formatTime(
-          projections.products1m.time
-        )}</div>
+        <div><strong>Time:</strong> ${formatTime(projections.products1m)}</div>
         <div><strong>Cost:</strong> ${projections.products1m.cost.toFixed(
           0
         )} points</div>
@@ -1366,9 +1513,7 @@ class Benchmarkify {
 
     if (this.projection10m) {
       this.projection10m.innerHTML = `
-        <div><strong>Time:</strong> ${formatTime(
-          projections.products10m.time
-        )}</div>
+        <div><strong>Time:</strong> ${formatTime(projections.products10m)}</div>
         <div><strong>Cost:</strong> ${projections.products10m.cost.toFixed(
           0
         )} points</div>
@@ -1381,5 +1526,34 @@ class Benchmarkify {
 
 // Initialize the app when DOM is loaded
 document.addEventListener("DOMContentLoaded", () => {
-  new Benchmarkify();
+  const app = new Benchmarkify();
+
+  // Auto-trigger rate limit analysis when credentials are loaded
+  const autoAnalyzeRateLimits = () => {
+    const storeUrl = document.getElementById("storeUrl").value;
+    const accessToken = document.getElementById("accessToken").value;
+
+    if (storeUrl && accessToken) {
+      // Small delay to ensure the app is fully initialized
+      setTimeout(() => {
+        app.analyzeRateLimits();
+      }, 1000);
+    }
+  };
+
+  // Check if credentials are already filled (from stored credentials)
+  if (
+    document.getElementById("storeUrl").value &&
+    document.getElementById("accessToken").value
+  ) {
+    autoAnalyzeRateLimits();
+  }
+
+  // Also listen for credential changes
+  document
+    .getElementById("storeUrl")
+    .addEventListener("input", autoAnalyzeRateLimits);
+  document
+    .getElementById("accessToken")
+    .addEventListener("input", autoAnalyzeRateLimits);
 });

@@ -13,7 +13,7 @@
             <p>Benchmark your Shopify store's GraphQL API performance</p>
             <div class="api-info">
                 <span class="api-badge">GraphQL Admin API</span>
-                <span class="version-badge">v2023-10</span>
+                <span class="version-badge">v2025-07</span>
             </div>
         </header>
 
@@ -71,6 +71,11 @@
                                 <strong>💡 Tip:</strong> Update and Delete operations work best when Create is enabled first, as they need existing products to work with. 
                                 All operations are tagged with unique identifiers to ensure safety. <strong>🚀 High-Volume:</strong> This tool can now handle thousands of API calls for comprehensive performance testing.
                             </p>
+                            <div style="margin-top: 10px; padding: 8px; background: #fef3c7; border-radius: 4px;">
+                                <p style="margin: 0; font-size: 0.85rem; color: #92400e;">
+                                    <strong>⏱️ Smart Delays:</strong> The system automatically adds delays between operations (3s after Create, 2s after Update) to ensure Shopify's indexing catches up before proceeding.
+                                </p>
+                            </div>
                         </div>
                     </div>
                     
@@ -94,6 +99,11 @@
                     <div class="safety-info">
                         <div class="safety-badge">🛡️ Safety First</div>
                         <p>All benchmark products are tagged with <code>benchmarkify-{timestamp}</code> to ensure we only modify our test data.</p>
+                        <div class="fallback-info" style="margin-top: 10px; padding: 10px; background: #fef3c7; border-radius: 6px; border-left: 4px solid #f59e0b;">
+                            <p style="margin: 0; font-size: 0.9rem; color: #92400e;">
+                                <strong>🔄 Smart Fallback:</strong> If you restart the server, Update/Delete operations will automatically find existing benchmark products or recently created products to work with. No need to recreate products manually!
+                            </p>
+                        </div>
                     </div>
                     
 
@@ -187,7 +197,7 @@
                         <div class="rate-limit-card">
                             <div class="card-header">Max Products/sec</div>
                             <div class="card-value" id="maxProductsPerSecond">-</div>
-                            <div class="card-label">Theoretical limit</div>
+                            <div class="card-label">Based on API rate limits</div>
                         </div>
                     </div>
                 </div>
@@ -291,7 +301,7 @@
         </main>
 
         <footer>
-            <p>Built with ❤️ for Shopify developers | GraphQL Admin API v2023-10</p>
+            <p>Built with ❤️ for Shopify developers | GraphQL Admin API v2025-07</p>
         </footer>
     </div>
 

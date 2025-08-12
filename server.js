@@ -24,6 +24,7 @@ const auditLog = {
   endTime: null,
   operations: [],
   rateLimitHistory: [],
+  createdProductIds: [], // Store created product IDs for direct deletion
   summary: {
     totalOperations: 0,
     successfulOperations: 0,
@@ -65,6 +66,26 @@ function logOperation(operation) {
     timestamp: new Date().toISOString(),
     ...operation,
   });
+}
+
+// Store created product IDs for direct deletion
+function storeCreatedProductId(productId, productTitle) {
+  auditLog.createdProductIds.push({
+    id: productId,
+    title: productTitle,
+    timestamp: new Date().toISOString(),
+    sessionTag: SESSION_BENCHMARK_TAG,
+  });
+  console.log(
+    `📝 Stored product ID for deletion: ${productId} (${productTitle})`
+  );
+}
+
+// Get stored product IDs for deletion
+function getStoredProductIds(count = null) {
+  const ids = auditLog.createdProductIds;
+  if (count === null) return ids;
+  return ids.slice(0, Math.min(count, ids.length));
 }
 
 function logRateLimitStatus(
@@ -154,6 +175,45 @@ function finalizeAuditLog() {
   );
 }
 
+// Helper: return all known created product IDs from memory (primary)
+// and audit operations (secondary) in case primary missed some
+function getKnownBenchmarkProductIds(limit = null) {
+  const fromMemory = Array.isArray(auditLog.createdProductIds)
+    ? auditLog.createdProductIds
+    : [];
+
+  const fromOps = Array.isArray(auditLog.operations)
+    ? auditLog.operations
+        .filter(
+          (op) =>
+            op.action === "createProduct" &&
+            op.success &&
+            op.productId &&
+            op.productId !== "N/A"
+        )
+        .map((op) => ({
+          id: op.productId,
+          title: "Benchmark product (ops)",
+          sessionTag: SESSION_BENCHMARK_TAG,
+        }))
+    : [];
+
+  const byId = new Map();
+  for (const p of [...fromMemory, ...fromOps]) {
+    if (p && p.id && !byId.has(p.id)) {
+      byId.set(p.id, {
+        id: p.id,
+        title: p.title || "Benchmark product",
+        sessionTag: SESSION_BENCHMARK_TAG,
+      });
+    }
+  }
+
+  const list = Array.from(byId.values());
+  if (limit == null) return list;
+  return list.slice(0, Math.min(limit, list.length));
+}
+
 // GraphQL queries with cost analysis
 const GRAPHQL_QUERIES = {
   // Product creation - typically costs 10 points
@@ -206,9 +266,16 @@ const GRAPHQL_QUERIES = {
 
   // Get products for updates/deletions - typically costs 1 point per product
   getProducts: `
-    query getProducts($first: Int!) {
-      products(first: $first) {
+    query getProducts(
+      $first: Int!
+      $after: String
+      $query: String
+      $sortKey: ProductSortKeys
+      $reverse: Boolean
+    ) {
+      products(first: $first, after: $after, query: $query, sortKey: $sortKey, reverse: $reverse) {
         edges {
+          cursor
           node {
             id
             title
@@ -216,6 +283,10 @@ const GRAPHQL_QUERIES = {
             createdAt
             tags
           }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
         }
       }
     }
@@ -242,7 +313,8 @@ function generateRandomProduct() {
         ["organic", "handmade", "sustainable", "local"],
         2
       ),
-      SESSION_BENCHMARK_TAG, // Add benchmark tag for safe identification
+      "benchmarkify",
+      // Removed session-specific tag; unified tagging only
     ],
     productOptions: [
       {
@@ -270,37 +342,160 @@ function createGraphQLClient(storeUrl, accessToken) {
 }
 
 // Calculate optimal batch configuration based on rate limits
-function calculateOptimalBatchConfig(leakRate, costPerProduct = 10) {
+function calculateOptimalBatchConfig(
+  leakRate,
+  costPerProduct = 10,
+  optimizationMode = "throughput"
+) {
   // Calculate how many products we can process per second
   const productsPerSecond = Math.floor(leakRate / costPerProduct);
 
-  // Batch size: aim for batches that complete in 1-2 seconds
-  // This allows for some burst capacity while maintaining steady flow
-  const optimalBatchSize = Math.min(
-    Math.max(productsPerSecond * 1.5, 5), // At least 5, up to 1.5x products/second
-    100 // Cap at 100 to avoid overwhelming the API
-  );
+  // Choose optimization strategy based on mode
+  let optimalBatchSize, finalDelay, safetyMargin;
 
-  // Delay: ensure we don't exceed the leak rate
-  // With leak rate of X points/second, we need to wait X/costPerProduct seconds between batches
-  const minDelayBetweenBatches = Math.ceil(
-    ((costPerProduct * optimalBatchSize) / leakRate) * 1000
-  );
+  if (optimizationMode === "aggressive") {
+    // Maximum throughput mode - push the limits
+    const bucketCapacity = leakRate * 2; // Approximate bucket capacity
+    const maxBatchSizeByCapacity = Math.floor(
+      (bucketCapacity * 0.9) / costPerProduct
+    );
+    const optimalBatchSizeByTime = Math.floor(productsPerSecond * 0.9);
 
-  // Add some safety margin (20%)
-  const safeDelayBetweenBatches = Math.ceil(minDelayBetweenBatches * 1.2);
+    optimalBatchSize = Math.min(
+      Math.max(maxBatchSizeByCapacity, optimalBatchSizeByTime, 20),
+      1000 // Higher cap for aggressive mode
+    );
+
+    const batchCost = optimalBatchSize * costPerProduct;
+    const minDelayForRateLimit = (batchCost / leakRate) * 1000;
+    safetyMargin = 1.02; // Only 2% safety margin
+    finalDelay = Math.max(Math.ceil(minDelayForRateLimit * safetyMargin), 25);
+  } else if (optimizationMode === "balanced") {
+    // Balanced mode - good throughput with reasonable safety
+    const bucketCapacity = leakRate * 2;
+    const maxBatchSizeByCapacity = Math.floor(
+      (bucketCapacity * 0.7) / costPerProduct
+    );
+    const optimalBatchSizeByTime = Math.floor(productsPerSecond * 0.7);
+
+    optimalBatchSize = Math.min(
+      Math.max(maxBatchSizeByCapacity, optimalBatchSizeByTime, 15),
+      300
+    );
+
+    const batchCost = optimalBatchSize * costPerProduct;
+    const minDelayForRateLimit = (batchCost / leakRate) * 1000;
+    safetyMargin = 1.1; // 10% safety margin
+    finalDelay = Math.max(Math.ceil(minDelayForRateLimit * safetyMargin), 50);
+  } else {
+    // Default throughput mode (current optimized approach)
+    const bucketCapacity = leakRate * 2;
+    const maxBatchSizeByCapacity = Math.floor(
+      (bucketCapacity * 0.8) / costPerProduct
+    );
+    const optimalBatchSizeByTime = Math.floor(productsPerSecond * 0.8);
+
+    optimalBatchSize = Math.min(
+      Math.max(maxBatchSizeByCapacity, optimalBatchSizeByTime, 10),
+      500
+    );
+
+    const batchCost = optimalBatchSize * costPerProduct;
+    const minDelayForRateLimit = (batchCost / leakRate) * 1000;
+    safetyMargin = 1.05; // 5% safety margin
+    finalDelay = Math.max(Math.ceil(minDelayForRateLimit * safetyMargin), 50);
+  }
+
+  const batchCost = optimalBatchSize * costPerProduct;
+  const minDelayForRateLimit = (batchCost / leakRate) * 1000;
 
   console.log(
     `Rate limit analysis - Leak rate: ${leakRate} points/sec, Products/sec: ${productsPerSecond}`
   );
   console.log(
-    `Optimal batch size: ${optimalBatchSize}, Delay: ${safeDelayBetweenBatches}ms`
+    `Optimization mode: ${optimizationMode} - Batch size: ${optimalBatchSize}, Delay: ${finalDelay}ms`
+  );
+  console.log(
+    `Batch cost: ${batchCost} points, Safety margin: ${(
+      (safetyMargin - 1) *
+      100
+    ).toFixed(1)}%`
   );
 
   return {
     batchSize: Math.floor(optimalBatchSize),
-    delayBetweenBatches: Math.min(safeDelayBetweenBatches, 5000), // Cap at 5 seconds
+    delayBetweenBatches: Math.min(finalDelay, 2000), // Cap at 2 seconds for responsiveness
   };
+}
+
+// Helper: fetch benchmark products with optional GraphQL query filter and pagination
+async function fetchBenchmarkProducts(
+  client,
+  storeUrl,
+  accessToken,
+  maxCount = 250
+) {
+  console.log(`🚀 fetchBenchmarkProducts called with maxCount: ${maxCount}`);
+  console.log(`🚀 Client URL: ${client.url}`);
+  const products = [];
+  let after = null;
+  const perPage = Math.min(250, maxCount);
+  // Try combined filter first, then fallback to unified tag only
+  const queriesToTry = [`tag:benchmarkify`];
+  console.log(`🚀 Will try queries:`, queriesToTry);
+  for (const queryFilter of queriesToTry) {
+    after = null;
+    while (products.length < maxCount) {
+      const variables = {
+        first: perPage,
+        after,
+        query: queryFilter,
+        sortKey: "CREATED_AT",
+        reverse: true,
+      };
+      const result = await handleGraphQLRequest(
+        client,
+        GRAPHQL_QUERIES.getProducts,
+        variables,
+        "getProducts",
+        storeUrl,
+        accessToken
+      );
+      console.log(
+        `🔍 GraphQL request result:`,
+        JSON.stringify(result, null, 2)
+      );
+      if (!result.success) break;
+      const edges = result.data?.data?.products?.edges || [];
+      console.log(
+        `🔍 GraphQL query returned ${edges.length} edges for filter: ${queryFilter}`
+      );
+      console.log(
+        `🔍 Full response data:`,
+        JSON.stringify(result.data, null, 2)
+      );
+      for (const edge of edges) {
+        const node = edge.node;
+        const tags = node.tags || [];
+        console.log(`🔍 Product: ${node.title}, Tags: [${tags.join(", ")}]`);
+        // Only check for the unified "benchmarkify" tag since that's what we use now
+        if (tags.includes("benchmarkify")) {
+          products.push(node);
+          console.log(`✅ Added product: ${node.title}`);
+        } else {
+          console.log(
+            `❌ Skipped product: ${node.title} (no "benchmarkify" tag)`
+          );
+        }
+        if (products.length >= maxCount) break;
+      }
+      const pageInfo = result.data?.data?.products?.pageInfo;
+      if (!pageInfo?.hasNextPage) break;
+      after = pageInfo.endCursor;
+    }
+    if (products.length) break;
+  }
+  return products;
 }
 
 // Helper function to handle Shopify rate limits and extract costs
@@ -914,12 +1109,48 @@ app.post("/api/rate-limit-analysis", async (req, res) => {
       const totalCost = productCount * costPerProduct;
       // With leak rate (points/second), we can calculate time more accurately
       const timeInSeconds = totalCost / leakRate; // points / (points/second) = seconds
+
+      // Calculate optimal batch size and delay for more accurate time estimates
+      // Use aggressive mode for maximum throughput in time estimates
+      const { batchSize, delayBetweenBatches } = calculateOptimalBatchConfig(
+        leakRate,
+        costPerProduct,
+        "aggressive"
+      );
+      const productsPerBatch = batchSize;
+      const totalBatches = Math.ceil(productCount / productsPerBatch);
+
+      // Calculate actual processing time including delays between batches
+      const processingTimeSeconds = totalCost / leakRate; // Pure processing time
+      const totalDelaySeconds =
+        (totalBatches - 1) * (delayBetweenBatches / 1000); // Delays between batches
+      const totalTimeSeconds = processingTimeSeconds + totalDelaySeconds;
+
+      // Format time display based on duration
+      let timeDisplay, timeUnit;
+      if (totalTimeSeconds < 60) {
+        timeDisplay = Math.ceil(totalTimeSeconds);
+        timeUnit = "seconds";
+      } else if (totalTimeSeconds < 3600) {
+        timeDisplay = Math.ceil(totalTimeSeconds / 60);
+        timeUnit = "minutes";
+      } else {
+        timeDisplay = Math.ceil(totalTimeSeconds / 3600);
+        timeUnit = "hours";
+      }
+
       return {
-        timeInSeconds,
-        timeInMinutes: Math.ceil(timeInSeconds / 60),
-        timeInHours: Math.ceil(timeInSeconds / 3600),
-        batches: Math.ceil(totalCost / leakRate), // For display purposes
+        timeInSeconds: totalTimeSeconds,
+        timeInMinutes: Math.ceil(totalTimeSeconds / 60),
+        timeInHours: Math.ceil(totalTimeSeconds / 3600),
+        timeDisplay: timeDisplay,
+        timeUnit: timeUnit,
+        batches: totalBatches,
+        batchSize: batchSize,
+        delayBetweenBatches: delayBetweenBatches,
         totalCost,
+        processingTimeSeconds,
+        totalDelaySeconds,
       };
     };
 
@@ -953,11 +1184,28 @@ app.post("/api/rate-limit-analysis", async (req, res) => {
         title: "Understanding Your API Rate Limits",
         description: `Your store appears to be on the ${planType} plan with a leak rate of ${leakRate} calculated query points per second. Each product operation (create/update/delete) costs ${costPerProduct} points.`,
         practicalMeaning: `This means you can perform approximately ${productsPerSecond} product operations per second, ${productsPerMinute} per minute, or ${productsPerHour} per hour through a single API client.`,
+        timeCalculationDetails: {
+          leakRate: leakRate,
+          costPerProduct: costPerProduct,
+          productsPerSecond: productsPerSecond,
+          optimizationMode: "aggressive",
+          batchSize: calculateOptimalBatchConfig(
+            leakRate,
+            costPerProduct,
+            "aggressive"
+          ).batchSize,
+          delayBetweenBatches: calculateOptimalBatchConfig(
+            leakRate,
+            costPerProduct,
+            "aggressive"
+          ).delayBetweenBatches,
+        },
         recommendations: [
-          "Use batch operations to maximize efficiency",
-          "Implement exponential backoff when hitting rate limits",
-          "Consider using multiple API clients for high-volume operations",
-          "Monitor rate limit usage during operations",
+          "Using aggressive optimization mode for maximum throughput",
+          "Large batch sizes reduce API overhead and improve efficiency",
+          "Minimal delays between batches maximize data flow",
+          "System will automatically retry with exponential backoff if rate limited",
+          "Monitor rate limit usage during high-volume operations",
           "Use the Shopify-GraphQL-Cost-Debug=1 header to analyze query costs",
           `Consider upgrading to a higher plan if you need more throughput (current: ${planType})`,
         ],
@@ -986,7 +1234,10 @@ app.post("/api/benchmark/create", async (req, res) => {
     }
 
     console.log(`Starting GraphQL product creation benchmark...`);
-    console.log(`🔒 Using benchmark tag: ${SESSION_BENCHMARK_TAG}`);
+    console.log(`🔒 Using benchmark tag: benchmarkify`);
+
+    // Create GraphQL client first
+    const client = createGraphQLClient(storeUrl, accessToken);
 
     // Get current rate limits to calculate optimal batch configuration
     const rateLimitResult = await handleGraphQLRequest(
@@ -1009,7 +1260,6 @@ app.post("/api/benchmark/create", async (req, res) => {
       `📊 Creating ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
     );
 
-    const client = createGraphQLClient(storeUrl, accessToken);
     const results = [];
     const numProducts = Math.min(Math.max(1, count), 1000000); // Support up to 1 million products
     const startTime = Date.now();
@@ -1052,6 +1302,16 @@ app.post("/api/benchmark/create", async (req, res) => {
       // Wait for batch to complete
       const batchResults = await Promise.all(batchPromises);
       results.push(...batchResults);
+
+      // Store successful product IDs for direct deletion
+      batchResults.forEach((result) => {
+        if (result.success && result.data?.productCreate?.product?.id) {
+          const productId = result.data.productCreate.product.id;
+          const productTitle =
+            result.data.productCreate.product.title || "Unknown Product";
+          storeCreatedProductId(productId, productTitle);
+        }
+      });
 
       // Check rate limit status and adapt if needed
       const lastResult = batchResults[batchResults.length - 1];
@@ -1173,6 +1433,425 @@ app.post("/api/benchmark/create", async (req, res) => {
   }
 });
 
+/* SECOND DELETE ENDPOINT DISABLED */
+// Benchmark endpoint for product deletion
+app.post("/api/benchmark/delete", async (req, res) => {
+  try {
+    const { storeUrl, accessToken, count = 3 } = req.body;
+
+    if (!storeUrl || !accessToken) {
+      return res.status(400).json({
+        error: "Missing store URL or access token",
+      });
+    }
+
+    console.log("Starting GraphQL product deletion benchmark...");
+    console.log(`🔒 Looking for products with tag: benchmarkify`);
+
+    // Create GraphQL client first
+    const client = createGraphQLClient(storeUrl, accessToken);
+
+    // Get current rate limits to calculate optimal batch configuration
+    const rateLimitResult = await handleGraphQLRequest(
+      client,
+      `query { shop { name id } }`,
+      {},
+      "rateLimitCheck",
+      storeUrl,
+      accessToken
+    );
+
+    const leakRate =
+      rateLimitResult.rateLimit?.leakRate ||
+      rateLimitResult.rateLimit?.restoreRate ||
+      100;
+    const { batchSize, delayBetweenBatches } =
+      calculateOptimalBatchConfig(leakRate);
+
+    console.log(
+      `📊 Deleting ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
+    );
+
+    // Fetch products with "benchmarkify" tag directly from Shopify
+    console.log(`🔍 Fetching products with tag: benchmarkify`);
+    const directResult = await handleGraphQLRequest(
+      client,
+      GRAPHQL_QUERIES.getProducts,
+      { first: 250, query: "tag:benchmarkify" },
+      "getProducts",
+      storeUrl,
+      accessToken
+    );
+    console.log(
+      `🔍 Direct GraphQL query result:`,
+      JSON.stringify(directResult, null, 2)
+    );
+
+    let productsToDelete = [];
+    if (directResult.success && directResult.data?.data?.products?.edges) {
+      const fetched = directResult.data.data.products.edges.map(
+        (edge) => edge.node
+      );
+      console.log(`🔍 Direct query returned ${fetched.length} products`);
+      productsToDelete = fetched;
+    } else {
+      console.log(`🔍 Direct query failed or returned no products`);
+      console.log(
+        `🔍 Response structure:`,
+        JSON.stringify(directResult.data, null, 2)
+      );
+      productsToDelete = [];
+    }
+
+    console.log(`🔍 Found ${productsToDelete.length} products to delete`);
+
+    // If we have products to delete, proceed with deletion
+    if (productsToDelete.length > 0) {
+      console.log(
+        `🎯 Proceeding with ${productsToDelete.length} products found via Shopify query`
+      );
+      const products = productsToDelete;
+      const results = [];
+
+      // Delete products in batches with adaptive rate limiting
+      const deleteCount = Math.min(
+        Math.max(1, count),
+        Math.min(products.length, 1000000)
+      ); // Support up to 1 million products
+      const startTime = Date.now();
+
+      for (
+        let batchStart = 0;
+        batchStart < deleteCount;
+        batchStart += batchSize
+      ) {
+        const batchEnd = Math.min(batchStart + batchSize, deleteCount);
+
+        console.log(
+          `🔄 Processing delete batch ${
+            Math.floor(batchStart / batchSize) + 1
+          }: products ${batchStart + 1}-${batchEnd}`
+        );
+
+        // Process batch in parallel
+        const batchPromises = [];
+        for (let i = batchStart; i < batchEnd; i++) {
+          const product = products[i];
+
+          batchPromises.push(
+            handleGraphQLRequest(
+              client,
+              GRAPHQL_QUERIES.deleteProduct,
+              { input: { id: product.id } },
+              "deleteProduct",
+              storeUrl,
+              accessToken
+            ).catch((error) => ({
+              success: false,
+              error: error.message,
+              cost: QUERY_COSTS.deleteProduct,
+            }))
+          );
+        }
+
+        // Wait for batch to complete
+        const batchResults = await Promise.all(batchPromises);
+        results.push(...batchResults);
+
+        // Check rate limit status and adapt if needed
+        const lastResult = batchResults[batchResults.length - 1];
+        if (lastResult && lastResult.rateLimit) {
+          const usagePercentage =
+            (lastResult.rateLimit.current / lastResult.rateLimit.limit) * 100;
+
+          if (usagePercentage > 80) {
+            // High usage - increase delay
+            const adaptiveDelay = Math.min(delayBetweenBatches * 2, 5000);
+            console.log(
+              `⚠️ High rate limit usage (${usagePercentage.toFixed(
+                1
+              )}%). Increasing delay to ${adaptiveDelay}ms`
+            );
+            await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
+          } else if (usagePercentage < 40) {
+            // Low usage - reduce delay
+            const adaptiveDelay = Math.max(delayBetweenBatches * 0.5, 50);
+            console.log(
+              `✅ Low rate limit usage (${usagePercentage.toFixed(
+                1
+              )}%). Reducing delay to ${adaptiveDelay}ms`
+            );
+            await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
+          } else {
+            // Normal usage - use configured delay
+            await new Promise((resolve) =>
+              setTimeout(resolve, delayBetweenBatches)
+            );
+          }
+        } else {
+          // Default delay if no rate limit info
+          await new Promise((resolve) =>
+            setTimeout(resolve, delayBetweenBatches)
+          );
+        }
+      }
+
+      const totalTime = (Date.now() - startTime) / 1000; // Convert to seconds
+
+      // Calculate metrics
+      const successfulResults = results.filter((r) => r.success);
+      const avgResponseTime =
+        successfulResults.length > 0
+          ? (
+              successfulResults.reduce((sum, r) => sum + r.responseTime, 0) /
+              successfulResults.length
+            ).toFixed(2)
+          : 0;
+
+      const totalCost = results.reduce((sum, r) => sum + (r.cost || 0), 0);
+      const avgCost = (totalCost / results.length).toFixed(2);
+
+      const successCount = successfulResults.length;
+      const totalCount = results.length;
+
+      // Calculate products per second based on cost limits
+      const costPerSecond =
+        successfulResults.length > 0
+          ? (
+              totalCost /
+              successfulResults.reduce((sum, r) => sum + r.responseTime, 0)
+            ).toFixed(2)
+          : 0;
+
+      // Calculate performance projections
+      const calculateProjection = (productCount) => {
+        const estimatedCost = productCount * avgCost;
+        const estimatedTime = estimatedCost / (totalCost / totalTime);
+        return {
+          time: estimatedTime,
+          cost: estimatedCost,
+        };
+      };
+
+      const performanceProjections = {
+        products1000: calculateProjection(1000),
+        products100k: calculateProjection(100000),
+        products1m: calculateProjection(1000000),
+        products10m: calculateProjection(10000000),
+      };
+
+      // Update audit log with performance data
+      auditLog.summary.totalTime = totalTime;
+      auditLog.summary.performanceProjections = performanceProjections;
+
+      res.json({
+        status: successCount > 0 ? "success" : "error",
+        responseTime: avgResponseTime,
+        totalTime: totalTime.toFixed(2),
+        rateLimit: results[results.length - 1]?.rateLimit || {
+          current: 0,
+          limit: 1000,
+          remaining: 1000,
+        },
+        details: `Deleted ${successCount}/${totalCount} products successfully using Shopify query. Total time: ${totalTime.toFixed(
+          2
+        )}s`,
+        cost: {
+          total: totalCost,
+          average: avgCost,
+          perSecond: costPerSecond,
+          productsPerSecond: (1000 / avgCost).toFixed(2),
+        },
+        performanceProjections,
+      });
+      return;
+    } else {
+      // Fallback: We already set productsToDelete above; use them directly
+      const benchmarkProducts = productsToDelete;
+
+      // Only allow deletions of products created by Benchmarkify ('benchmarkify' tag)
+
+      if (benchmarkProducts.length === 0) {
+        return res.json({
+          status: "error",
+          responseTime: 0,
+          totalTime: 0,
+          rateLimit: { current: 0, limit: 1000, remaining: 1000 },
+          details: "No benchmark products available for deletion",
+          cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+          performanceProjections: {},
+        });
+      }
+
+      console.log(
+        `🔍 Found ${benchmarkProducts.length} benchmark products to delete`
+      );
+
+      const products = benchmarkProducts;
+      const results = [];
+
+      // Delete products in batches with adaptive rate limiting
+      const deleteCount = Math.min(
+        Math.max(1, count),
+        Math.min(products.length, 1000000)
+      ); // Support up to 1 million products
+      const startTime = Date.now();
+
+      for (
+        let batchStart = 0;
+        batchStart < deleteCount;
+        batchStart += batchSize
+      ) {
+        const batchEnd = Math.min(batchStart + batchSize, deleteCount);
+
+        console.log(
+          `🔄 Processing delete batch ${
+            Math.floor(batchStart / batchSize) + 1
+          }: products ${batchStart + 1}-${batchEnd}`
+        );
+
+        // Process batch in parallel
+        const batchPromises = [];
+        for (let i = batchStart; i < batchEnd; i++) {
+          const product = products[i];
+
+          batchPromises.push(
+            handleGraphQLRequest(
+              client,
+              GRAPHQL_QUERIES.deleteProduct,
+              { input: { id: product.id } },
+              "deleteProduct",
+              storeUrl,
+              accessToken
+            ).catch((error) => ({
+              success: false,
+              error: error.message,
+              cost: QUERY_COSTS.deleteProduct,
+            }))
+          );
+        }
+
+        // Wait for batch to complete
+        const batchResults = await Promise.all(batchPromises);
+        results.push(...batchResults);
+
+        // Check rate limit status and adapt if needed
+        const lastResult = batchResults[batchResults.length - 1];
+        if (lastResult && lastResult.rateLimit) {
+          const usagePercentage =
+            (lastResult.rateLimit.current / lastResult.rateLimit.limit) * 100;
+
+          if (usagePercentage > 80) {
+            // High usage - increase delay
+            const adaptiveDelay = Math.min(delayBetweenBatches * 2, 5000);
+            console.log(
+              `⚠️ High rate limit usage (${usagePercentage.toFixed(
+                1
+              )}%). Increasing delay to ${adaptiveDelay}ms`
+            );
+            await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
+          } else if (usagePercentage < 40) {
+            // Low usage - reduce delay
+            const adaptiveDelay = Math.max(delayBetweenBatches * 0.5, 50);
+            console.log(
+              `✅ Low rate limit usage (${usagePercentage.toFixed(
+                1
+              )}%). Reducing delay to ${adaptiveDelay}ms`
+            );
+            await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
+          } else {
+            // Normal usage - use configured delay
+            await new Promise((resolve) =>
+              setTimeout(resolve, delayBetweenBatches)
+            );
+          }
+        } else {
+          // Default delay if no rate limit info
+          await new Promise((resolve) =>
+            setTimeout(resolve, delayBetweenBatches)
+          );
+        }
+      }
+
+      const totalTime = (Date.now() - startTime) / 1000; // Convert to seconds
+
+      // Calculate metrics
+      const successfulResults = results.filter((r) => r.success);
+      const avgResponseTime =
+        successfulResults.length > 0
+          ? (
+              successfulResults.reduce((sum, r) => sum + r.responseTime, 0) /
+              successfulResults.length
+            ).toFixed(2)
+          : 0;
+
+      const totalCost = results.reduce((sum, r) => sum + (r.cost || 0), 0);
+      const avgCost = (totalCost / results.length).toFixed(2);
+
+      const successCount = successfulResults.length;
+      const totalCount = results.length;
+
+      // Calculate products per second based on cost limits
+      const costPerSecond =
+        successfulResults.length > 0
+          ? (
+              totalCost /
+              successfulResults.reduce((sum, r) => sum + r.responseTime, 0)
+            ).toFixed(2)
+          : 0;
+
+      // Calculate performance projections
+      const calculateProjection = (productCount) => {
+        const estimatedCost = productCount * avgCost;
+        const estimatedTime = estimatedCost / (totalCost / totalTime);
+        return {
+          time: estimatedTime,
+          cost: estimatedCost,
+        };
+      };
+
+      const performanceProjections = {
+        products1000: calculateProjection(1000),
+        products100k: calculateProjection(100000),
+        products1m: calculateProjection(1000000),
+        products10m: calculateProjection(10000000),
+      };
+
+      res.json({
+        status: successCount > 0 ? "success" : "error",
+        responseTime: avgResponseTime,
+        totalTime: totalTime.toFixed(2),
+        rateLimit: results[results.length - 1]?.rateLimit || {
+          current: 0,
+          limit: 1000,
+          remaining: 1000,
+        },
+        details: `Deleted ${successCount}/${totalCount} products successfully using Shopify query. Total time: ${totalTime.toFixed(
+          2
+        )}s`,
+        cost: {
+          total: totalCost,
+          average: avgCost,
+          perSecond: costPerSecond,
+          productsPerSecond: (1000 / avgCost).toFixed(2),
+        },
+        performanceProjections,
+      });
+    }
+  } catch (error) {
+    console.error("Product deletion benchmark error:", error);
+    res.status(500).json({
+      status: "error",
+      responseTime: 0,
+      totalTime: 0,
+      rateLimit: { current: 0, limit: 1000, remaining: 1000 },
+      details: error.message,
+      cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
+      performanceProjections: {},
+    });
+  }
+});
+
 // Benchmark endpoint for product updates
 app.post("/api/benchmark/update", async (req, res) => {
   try {
@@ -1185,7 +1864,10 @@ app.post("/api/benchmark/update", async (req, res) => {
     }
 
     console.log("Starting GraphQL product update benchmark...");
-    console.log(`🔒 Looking for products with tag: ${SESSION_BENCHMARK_TAG}`);
+    console.log(`🔒 Looking for products with tag: benchmarkify`);
+
+    // Create GraphQL client first
+    const client = createGraphQLClient(storeUrl, accessToken);
 
     // Get current rate limits to calculate optimal batch configuration
     const rateLimitResult = await handleGraphQLRequest(
@@ -1208,41 +1890,43 @@ app.post("/api/benchmark/update", async (req, res) => {
       `📊 Updating ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
     );
 
-    const client = createGraphQLClient(storeUrl, accessToken);
-
-    // First, get existing products with benchmark tag
-    const productsResponse = await handleGraphQLRequest(
+    // Fetch products with "benchmarkify" tag directly from Shopify
+    console.log(`🔍 Fetching products with tag: benchmarkify`);
+    const directResult = await handleGraphQLRequest(
       client,
       GRAPHQL_QUERIES.getProducts,
-      { first: 250 }, // Get more products to find benchmark ones
+      { first: 250, query: "tag:benchmarkify" },
       "getProducts",
       storeUrl,
       accessToken
     );
+    console.log(
+      `🔍 Direct GraphQL query result:`,
+      JSON.stringify(directResult, null, 2)
+    );
 
-    if (
-      !productsResponse.success ||
-      !productsResponse.data?.products?.edges?.length
-    ) {
-      return res.json({
-        status: "error",
-        responseTime: 0,
-        totalTime: 0,
-        rateLimit: { current: 0, limit: 1000, remaining: 1000 },
-        details: "No products found to update",
-        cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
-        performanceProjections: {},
-      });
+    let allProducts = [];
+    if (directResult.success && directResult.data?.data?.products?.edges) {
+      const fetched = directResult.data.data.products.edges.map(
+        (edge) => edge.node
+      );
+      console.log(`🔍 Direct query returned ${fetched.length} products`);
+      allProducts = fetched;
+    } else {
+      console.log(`🔍 Direct query failed or returned no products`);
+      console.log(
+        `🔍 Response structure:`,
+        JSON.stringify(directResult.data, null, 2)
+      );
+      allProducts = [];
     }
 
-    // Filter products to only include benchmark products
-    const allProducts = productsResponse.data.products.edges.map(
-      (edge) => edge.node
-    );
+    console.log(`🔍 Found ${allProducts.length} products to update`);
 
-    const benchmarkProducts = allProducts.filter(
-      (product) => product.tags && product.tags.includes(SESSION_BENCHMARK_TAG)
-    );
+    // Products are fetched directly from Shopify with "benchmarkify" tag
+    const benchmarkProducts = allProducts;
+
+    // Only allow updates to products created by Benchmarkify (with "benchmarkify" tag)
 
     if (benchmarkProducts.length === 0) {
       return res.json({
@@ -1250,7 +1934,7 @@ app.post("/api/benchmark/update", async (req, res) => {
         responseTime: 0,
         totalTime: 0,
         rateLimit: { current: 0, limit: 1000, remaining: 1000 },
-        details: `No benchmark products found with tag: ${SESSION_BENCHMARK_TAG}`,
+        details: "No benchmark products available for update",
         cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
         performanceProjections: {},
       });
@@ -1429,257 +2113,6 @@ app.post("/api/benchmark/update", async (req, res) => {
     });
   }
 });
-
-// Benchmark endpoint for product deletion
-app.post("/api/benchmark/delete", async (req, res) => {
-  try {
-    const { storeUrl, accessToken, count = 3 } = req.body;
-
-    if (!storeUrl || !accessToken) {
-      return res.status(400).json({
-        error: "Missing store URL or access token",
-      });
-    }
-
-    console.log("Starting GraphQL product deletion benchmark...");
-    console.log(`🔒 Looking for products with tag: ${SESSION_BENCHMARK_TAG}`);
-
-    // Get current rate limits to calculate optimal batch configuration
-    const rateLimitResult = await handleGraphQLRequest(
-      client,
-      `query { shop { name id } }`,
-      {},
-      "rateLimitCheck",
-      storeUrl,
-      accessToken
-    );
-
-    const leakRate =
-      rateLimitResult.rateLimit?.leakRate ||
-      rateLimitResult.rateLimit?.restoreRate ||
-      100;
-    const { batchSize, delayBetweenBatches } =
-      calculateOptimalBatchConfig(leakRate);
-
-    console.log(
-      `📊 Deleting ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
-    );
-
-    const client = createGraphQLClient(storeUrl, accessToken);
-
-    // Get products to delete (only benchmark products)
-    const productsResponse = await handleGraphQLRequest(
-      client,
-      GRAPHQL_QUERIES.getProducts,
-      { first: 250 }, // Get more products to find benchmark ones
-      "getProducts",
-      storeUrl,
-      accessToken
-    );
-
-    if (
-      !productsResponse.success ||
-      !productsResponse.data?.products?.edges?.length
-    ) {
-      return res.json({
-        status: "error",
-        responseTime: 0,
-        totalTime: 0,
-        rateLimit: { current: 0, limit: 1000, remaining: 1000 },
-        details: "No products found to delete",
-        cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
-        performanceProjections: {},
-      });
-    }
-
-    // Filter products to only include benchmark products
-    const allProducts = productsResponse.data.products.edges.map(
-      (edge) => edge.node
-    );
-
-    const benchmarkProducts = allProducts.filter(
-      (product) => product.tags && product.tags.includes(SESSION_BENCHMARK_TAG)
-    );
-
-    if (benchmarkProducts.length === 0) {
-      return res.json({
-        status: "error",
-        responseTime: 0,
-        totalTime: 0,
-        rateLimit: { current: 0, limit: 1000, remaining: 1000 },
-        details: `No benchmark products found with tag: ${SESSION_BENCHMARK_TAG}`,
-        cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
-        performanceProjections: {},
-      });
-    }
-
-    console.log(
-      `🔍 Found ${benchmarkProducts.length} benchmark products to delete`
-    );
-
-    const products = benchmarkProducts;
-    const results = [];
-
-    // Delete products in batches with adaptive rate limiting
-    const deleteCount = Math.min(
-      Math.max(1, count),
-      Math.min(products.length, 1000000)
-    ); // Support up to 1 million products
-    const startTime = Date.now();
-
-    for (
-      let batchStart = 0;
-      batchStart < deleteCount;
-      batchStart += batchSize
-    ) {
-      const batchEnd = Math.min(batchStart + batchSize, deleteCount);
-
-      console.log(
-        `🔄 Processing delete batch ${
-          Math.floor(batchStart / batchSize) + 1
-        }: products ${batchStart + 1}-${batchEnd}`
-      );
-
-      // Process batch in parallel
-      const batchPromises = [];
-      for (let i = batchStart; i < batchEnd; i++) {
-        const product = products[i];
-
-        batchPromises.push(
-          handleGraphQLRequest(
-            client,
-            GRAPHQL_QUERIES.deleteProduct,
-            { input: { id: product.id } },
-            "deleteProduct",
-            storeUrl,
-            accessToken
-          ).catch((error) => ({
-            success: false,
-            error: error.message,
-            cost: QUERY_COSTS.deleteProduct,
-          }))
-        );
-      }
-
-      // Wait for batch to complete
-      const batchResults = await Promise.all(batchPromises);
-      results.push(...batchResults);
-
-      // Check rate limit status and adapt if needed
-      const lastResult = batchResults[batchResults.length - 1];
-      if (lastResult && lastResult.rateLimit) {
-        const usagePercentage =
-          (lastResult.rateLimit.current / lastResult.rateLimit.limit) * 100;
-
-        if (usagePercentage > 80) {
-          // High usage - increase delay
-          const adaptiveDelay = Math.min(delayBetweenBatches * 2, 5000);
-          console.log(
-            `⚠️ High rate limit usage (${usagePercentage.toFixed(
-              1
-            )}%). Increasing delay to ${adaptiveDelay}ms`
-          );
-          await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-        } else if (usagePercentage < 40) {
-          // Low usage - reduce delay
-          const adaptiveDelay = Math.max(delayBetweenBatches * 0.5, 50);
-          console.log(
-            `✅ Low rate limit usage (${usagePercentage.toFixed(
-              1
-            )}%). Reducing delay to ${adaptiveDelay}ms`
-          );
-          await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-        } else {
-          // Normal usage - use configured delay
-          await new Promise((resolve) =>
-            setTimeout(resolve, delayBetweenBatches)
-          );
-        }
-      } else {
-        // Default delay if no rate limit info
-        await new Promise((resolve) =>
-          setTimeout(resolve, delayBetweenBatches)
-        );
-      }
-    }
-
-    // Calculate metrics
-    const successfulResults = results.filter((r) => r.success);
-    const avgResponseTime =
-      successfulResults.length > 0
-        ? (
-            successfulResults.reduce((sum, r) => sum + r.responseTime, 0) /
-            successfulResults.length
-          ).toFixed(2)
-        : 0;
-
-    const totalCost = results.reduce((sum, r) => sum + (r.cost || 0), 0);
-    const avgCost = (totalCost / results.length).toFixed(2);
-
-    const successCount = successfulResults.length;
-    const totalCount = results.length;
-
-    const totalTime = (Date.now() - startTime) / 1000; // Convert to seconds
-
-    const costPerSecond =
-      successfulResults.length > 0
-        ? (
-            totalCost /
-            successfulResults.reduce((sum, r) => sum + r.responseTime, 0)
-          ).toFixed(2)
-        : 0;
-
-    // Calculate performance projections
-    const calculateProjection = (productCount) => {
-      const estimatedCost = productCount * avgCost;
-      const estimatedTime = estimatedCost / (totalCost / totalTime);
-      return {
-        time: estimatedTime,
-        cost: estimatedCost,
-      };
-    };
-
-    const performanceProjections = {
-      products1000: calculateProjection(1000),
-      products100k: calculateProjection(100000),
-      products1m: calculateProjection(1000000),
-      products10m: calculateProjection(10000000),
-    };
-
-    res.json({
-      status: successCount > 0 ? "success" : "error",
-      responseTime: avgResponseTime,
-      totalTime: totalTime.toFixed(2),
-      rateLimit: results[results.length - 1]?.rateLimit || {
-        current: 0,
-        limit: 1000,
-        remaining: 1000,
-      },
-      details: `Deleted ${successCount}/${totalCount} products successfully. Total time: ${totalTime.toFixed(
-        2
-      )}s`,
-      cost: {
-        total: totalCost,
-        average: avgCost,
-        perSecond: costPerSecond,
-        productsPerSecond: (1000 / avgCost).toFixed(2),
-      },
-      performanceProjections,
-    });
-  } catch (error) {
-    console.error("Product deletion benchmark error:", error);
-    res.status(500).json({
-      status: "error",
-      responseTime: 0,
-      totalTime: 0,
-      rateLimit: { current: 0, limit: 1000, remaining: 1000 },
-      details: error.message,
-      cost: { total: 0, average: 0, perSecond: 0, productsPerSecond: 0 },
-      performanceProjections: {},
-    });
-  }
-});
-
 // Health check endpoint
 app.get("/api/health", (req, res) => {
   res.json({
@@ -1738,7 +2171,7 @@ app.post("/api/cleanup-benchmark", async (req, res) => {
     );
 
     const benchmarkProducts = allProducts.filter(
-      (product) => product.tags && product.tags.includes(SESSION_BENCHMARK_TAG)
+      (product) => product.tags && product.tags.includes("benchmarkify")
     );
 
     if (benchmarkProducts.length === 0) {
