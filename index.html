@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Benchmarkify - Shopify GraphQL Benchmarking</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Benchmarkify</h1>
+            <p>Benchmark your Shopify store's GraphQL API performance</p>
+            <div class="api-info">
+                <span class="api-badge">GraphQL Admin API</span>
+                <span class="version-badge">v2023-10</span>
+            </div>
+        </header>
+
+        <main>
+            <div class="credentials-section">
+                <h2>Store Credentials</h2>
+                <form id="credentialsForm">
+                    <div class="form-group">
+                        <label for="storeUrl">Shopify Store URL</label>
+                        <input 
+                            type="url" 
+                            id="storeUrl" 
+                            name="storeUrl" 
+                            placeholder="https://your-store.myshopify.com"
+                            required
+                        >
+                    </div>
+                    <div class="form-group">
+                        <label for="accessToken">Admin API Access Token</label>
+                        <input 
+                            type="password" 
+                            id="accessToken" 
+                            name="accessToken" 
+                            placeholder="shpat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                            required
+                        >
+                    </div>
+                    <button type="submit" class="btn-primary">Start GraphQL Benchmarking</button>
+                </form>
+                
+                <div class="benchmark-config" style="margin-top: 20px; padding: 20px; background: #f8f9fa; border-radius: 10px; border: 1px solid #e2e8f0;">
+                    <h3>⚙️ Benchmark Configuration</h3>
+                    
+                    <div class="operations-selection" style="margin-bottom: 20px; padding: 15px; background: #fff; border-radius: 8px; border: 1px solid #e2e8f0;">
+                        <h4 style="margin-top: 0; color: #374151;">🎯 Select Operations to Run</h4>
+                        <div class="operations-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                            <label class="operation-checkbox" style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 6px; cursor: pointer; border: 2px solid transparent; transition: all 0.2s;">
+                                <input type="checkbox" id="enableCreate" name="enableCreate" checked style="width: 18px; height: 18px;">
+                                <span style="font-weight: 600; color: #059669;">✅ Create Products</span>
+                                <small style="color: #6b7280;">Benchmark product creation performance</small>
+                            </label>
+                            <label class="operation-checkbox" style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 6px; cursor: pointer; border: 2px solid transparent; transition: all 0.2s;">
+                                <input type="checkbox" id="enableUpdate" name="enableUpdate" checked>
+                                <span style="font-weight: 600; color: #dc2626;">✅ Update Products</span>
+                                <small style="color: #6b7280;">Benchmark product update performance</small>
+                            </label>
+                            <label class="operation-checkbox" style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #f8f9fa; border-radius: 6px; cursor: pointer; border: 2px solid transparent; transition: all 0.2s;">
+                                <input type="checkbox" id="enableDelete" name="enableDelete" checked>
+                                <span style="font-weight: 600; color: #7c3aed;">✅ Delete Products</span>
+                                <small style="color: #6b7280;">Benchmark product deletion performance</small>
+                            </label>
+                        </div>
+                        <div class="operations-help" style="margin-top: 15px; padding: 10px; background: #f0f9ff; border-radius: 6px; border-left: 4px solid #0ea5e9;">
+                            <p style="margin: 0; font-size: 0.9rem; color: #0c4a6e;">
+                                <strong>💡 Tip:</strong> Update and Delete operations work best when Create is enabled first, as they need existing products to work with. 
+                                All operations are tagged with unique identifiers to ensure safety. <strong>🚀 High-Volume:</strong> This tool can now handle thousands of API calls for comprehensive performance testing.
+                            </p>
+                        </div>
+                    </div>
+                    
+                    <div class="config-grid">
+                        <div class="config-item">
+                            <label for="createCount">Products to Create:</label>
+                            <input type="number" id="createCount" name="createCount" min="1" max="10000" value="100" class="config-input">
+                            <small>Creates new products with random data (1-10,000)</small>
+                        </div>
+                        <div class="config-item">
+                            <label for="updateCount">Products to Update:</label>
+                            <input type="number" id="updateCount" name="updateCount" min="1" max="10000" value="100" class="config-input">
+                            <small>Updates existing benchmark products (1-10,000)</small>
+                        </div>
+                        <div class="config-item">
+                            <label for="deleteCount">Products to Delete:</label>
+                            <input type="number" id="deleteCount" name="deleteCount" min="1" max="10000" value="100" class="config-input">
+                            <small>Deletes only benchmark-created products (1-10,000)</small>
+                        </div>
+                    </div>
+                    <div class="safety-info">
+                        <div class="safety-badge">🛡️ Safety First</div>
+                        <p>All benchmark products are tagged with <code>benchmarkify-{timestamp}</code> to ensure we only modify our test data.</p>
+                    </div>
+                    
+                    <div class="performance-config" style="margin-top: 15px; padding: 15px; background: #fef3c7; border-radius: 8px; border: 1px solid #f59e0b;">
+                        <h4 style="margin-top: 0; color: #92400e;">⚡ Performance Configuration</h4>
+                        <div class="performance-grid" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px;">
+                            <div>
+                                <label for="batchSize">Batch Size:</label>
+                                <input type="number" id="batchSize" name="batchSize" min="1" max="100" value="10" class="config-input">
+                                <small>API calls per batch (1-100)</small>
+                            </div>
+                            <div>
+                                <label for="delayBetweenBatches">Delay (ms):</label>
+                                <input type="number" id="delayBetweenBatches" name="delayBetweenBatches" min="0" max="5000" value="100" class="config-input">
+                                <small>Delay between batches (0-5000ms)</small>
+                            </div>
+                        </div>
+                        <div style="margin-top: 10px; padding: 8px; background: #fef3c7; border-radius: 4px;">
+                            <p style="margin: 0; font-size: 0.85rem; color: #92400e;">
+                                <strong>💡 Performance Tip:</strong> Higher batch sizes increase throughput but may hit rate limits faster. 
+                                Adjust delay between batches to balance speed vs. API limits.
+                            </p>
+                            <div style="margin-top: 8px; padding: 8px; background: #fee2e2; border-radius: 4px; border-left: 3px solid #dc2626;">
+                                <p style="margin: 0; font-size: 0.8rem; color: #991b1b;">
+                                    <strong>⚠️ Rate Limit Warning:</strong> High-volume operations (1000+ products) may hit Shopify's API rate limits. 
+                                    Monitor the rate limit info during benchmarks and adjust batch size/delay accordingly.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="operations-summary" id="operationsSummary" style="margin-top: 15px; padding: 15px; background: #e6fffa; border-radius: 8px; border: 1px solid #81e6d9; display: none;">
+                        <h4 style="margin-top: 0; color: #065f46;">📋 Selected Operations</h4>
+                        <div id="operationsList" style="color: #065f46; font-size: 0.9rem;"></div>
+                    </div>
+                </div>
+                
+                <div class="test-buttons" style="margin-top: 20px;">
+                    <h3>🔧 Debug Tools</h3>
+                    <div class="test-grid">
+                        <button type="button" class="btn-secondary" id="testConnection">Test GraphQL Connection</button>
+                        <button type="button" class="btn-secondary" id="testSchema">Get Schema Info</button>
+                        <button type="button" class="btn-secondary" id="testProductCreate">Test Product Creation</button>
+                    </div>
+                    <div id="testResults" style="margin-top: 15px; padding: 15px; background: #f0f8ff; border-radius: 8px; display: none;">
+                        <h4>Test Results:</h4>
+                        <pre id="testOutput"></pre>
+                    </div>
+                </div>
+            </div>
+
+            <div class="benchmark-section" id="benchmarkSection" style="display: none;">
+                <h2>GraphQL Benchmark Results</h2>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="status" id="status">Preparing...</div>
+                
+                <div class="results-table">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Operation</th>
+                                <th>Status</th>
+                                <th>Response Time</th>
+                                <th>Rate Limit</th>
+                                <th>Query Cost</th>
+                                <th>Products/Second</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="resultsBody">
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="rate-limit-info" id="rateLimitInfo" style="display: none;">
+                    <h3>📊 Rate Limit & Cost Analysis</h3>
+                    <div class="rate-limit-grid">
+                        <div class="rate-limit-card">
+                            <div class="card-header">Current Usage</div>
+                            <div class="card-value" id="currentUsage">-</div>
+                            <div class="card-label">API calls used</div>
+                        </div>
+                        <div class="rate-limit-card">
+                            <div class="card-header">Remaining</div>
+                            <div class="card-value" id="remainingCalls">-</div>
+                            <div class="card-label">API calls left</div>
+                        </div>
+                        <div class="rate-limit-card">
+                            <div class="card-header">Total Cost</div>
+                            <div class="card-value" id="totalCost">-</div>
+                            <div class="card-label">Query cost points</div>
+                        </div>
+                        <div class="rate-limit-card">
+                            <div class="card-header">Max Products/sec</div>
+                            <div class="card-value" id="maxProductsPerSecond">-</div>
+                            <div class="card-label">Theoretical limit</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="graphql-payloads" id="graphqlPayloads" style="display: none;">
+                    <h3>🔍 GraphQL Queries & Mutations</h3>
+                    <div class="payload-tabs">
+                        <button class="tab-btn active" data-tab="create">Product Creation</button>
+                        <button class="tab-btn" data-tab="update">Product Update</button>
+                        <button class="tab-btn" data-tab="delete">Product Deletion</button>
+                        <button class="tab-btn" data-tab="query">Product Query</button>
+                    </div>
+                    <div class="payload-content">
+                        <div class="tab-content active" id="create-tab">
+                            <h4>Product Creation Mutation</h4>
+                            <div class="query-info">
+                                <span class="cost-badge">Cost: 10 points</span>
+                                <span class="type-badge">Mutation</span>
+                            </div>
+                            <pre class="graphql-code" id="createQuery"></pre>
+                        </div>
+                        <div class="tab-content" id="update-tab">
+                            <h4>Product Update Mutation</h4>
+                            <div class="query-info">
+                                <span class="cost-badge">Cost: 10 points</span>
+                                <span class="type-badge">Mutation</span>
+                            </div>
+                            <pre class="graphql-code" id="updateQuery"></pre>
+                        </div>
+                        <div class="tab-content" id="delete-tab">
+                            <h4>Product Deletion Mutation</h4>
+                            <div class="query-info">
+                                <span class="cost-badge">Cost: 10 points</span>
+                                <span class="type-badge">Mutation</span>
+                            </div>
+                            <pre class="graphql-code" id="deleteQuery"></pre>
+                        </div>
+                        <div class="tab-content" id="query-tab">
+                            <h4>Product Query</h4>
+                            <div class="query-info">
+                                <span class="cost-badge">Cost: 1 point per product</span>
+                                <span class="type-badge">Query</span>
+                            </div>
+                            <pre class="graphql-code" id="queryQuery"></pre>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="summary" id="summary" style="display: none;">
+                    <h3>Benchmark Summary</h3>
+                    <div class="summary-stats" id="summaryStats"></div>
+                    
+                    <div class="audit-log-section" style="margin-top: 30px; padding: 20px; background: #f8f9fa; border-radius: 10px; border: 1px solid #e2e8f0;">
+                        <h4 style="margin-top: 0; color: #374151;">📊 Audit Log & Download</h4>
+                        <p style="color: #6b7280; margin-bottom: 20px;">
+                            Download detailed logs of all operations, rate limit history, and performance metrics.
+                        </p>
+                        <div class="download-buttons" style="display: flex; gap: 15px; flex-wrap: wrap;">
+                            <button class="btn-secondary" id="downloadJsonLog">
+                                📄 Download JSON Log
+                            </button>
+                            <button class="btn-secondary" id="downloadTxtLog">
+                                📝 Download TXT Log
+                            </button>
+                            <button class="btn-secondary" id="viewAuditSummary">
+                                📊 View Summary
+                            </button>
+                        </div>
+                        <div id="auditSummary" style="margin-top: 20px; padding: 15px; background: white; border-radius: 8px; display: none;">
+                            <h5 style="margin-top: 0; color: #374151;">Audit Summary</h5>
+                            <div id="auditSummaryContent"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <p>Built with ❤️ for Shopify developers | GraphQL Admin API v2023-10</p>
+        </footer>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
