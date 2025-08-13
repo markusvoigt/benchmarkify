@@ -562,7 +562,11 @@ async function handleGraphQLRequest(
 
     const response = await fetch(client.url, {
       method: "POST",
-      headers: requestHeaders,
+      headers: {
+        ...requestHeaders,
+        // Include cost debug header to expose detailed cost info per Shopify docs
+        "Shopify-GraphQL-Cost-Debug": "1",
+      },
       body: JSON.stringify({
         query,
         variables,

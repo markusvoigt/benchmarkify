@@ -406,9 +406,13 @@ class Benchmarkify {
       );
     }
 
-    // Show benchmark section
+    // Show benchmark section and keep config visible but disabled
     this.benchmarkSection.style.display = "block";
-    this.form.style.display = "none";
+    // Temporarily disable inputs and buttons to prevent changes mid-run
+    const controls = document.querySelectorAll(
+      "#credentialsForm input, #credentialsForm button, .benchmark-config input, .benchmark-config button"
+    );
+    controls.forEach((el) => (el.disabled = true));
 
     // Start benchmarking with configuration
     await this.startBenchmark(storeUrl, accessToken, {
@@ -419,6 +423,9 @@ class Benchmarkify {
       delayBetweenBatches,
       delayBetweenOperations: 3, // 3 second delay between operations
     });
+
+    // Re-enable controls after run to allow immediate follow-up operations
+    controls.forEach((el) => (el.disabled = false));
   }
 
   async startBenchmark(storeUrl, accessToken, config) {
@@ -767,10 +774,13 @@ class Benchmarkify {
       }
     });
 
-    // Update rate limit display
-    this.currentUsage.textContent = currentUsage;
-    this.remainingCalls.textContent = limit - currentUsage;
-    this.totalCost.textContent = totalCost;
+    // Update rate limit display (calculated query cost points)
+    this.currentUsage.textContent = `${currentUsage} pts`;
+    this.remainingCalls.textContent = `${Math.max(
+      limit - currentUsage,
+      0
+    )} pts`;
+    this.totalCost.textContent = `${totalCost.toFixed(0)} pts`;
 
     // Use the actual calculated products per second from rate limit analysis
     // If we have rate limit data from analysis, use that; otherwise fall back to benchmark results
@@ -1443,10 +1453,12 @@ class Benchmarkify {
       this.maxProductsPerSecond.textContent =
         data.analysis.productsPerSecond.toFixed(2);
 
-      // Also update other rate limit info if available
+      // Also update other rate limit info if available (display in points)
       if (data.rateLimit) {
-        this.currentUsage.textContent = data.rateLimit.current || 0;
-        this.remainingCalls.textContent = data.rateLimit.remaining || 0;
+        const current = data.rateLimit.current || 0;
+        const remaining = data.rateLimit.remaining || 0;
+        this.currentUsage.textContent = `${current} pts`;
+        this.remainingCalls.textContent = `${remaining} pts`;
       }
 
       // Show the rate limit info section
