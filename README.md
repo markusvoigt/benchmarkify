@@ -20,6 +20,9 @@ A mini website for benchmarking Shopify store **GraphQL Admin API** performance.
 - **Random Data**: Uses Faker data for realistic testing
 - **Audit Logging**: Detailed logs of all operations for analysis
 
+Watch my **[Demo video](https://youtu.be/9hmVUj4yup0)** to see Benchmarkify in action!
+Try the hosted version [here](https://benchmarkify-f5a1b909cf31.herokuapp.com/)
+
 ## 🛠️ Setup
 
 ### Prerequisites

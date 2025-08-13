@@ -293,6 +293,59 @@ const GRAPHQL_QUERIES = {
   `,
 };
 
+/**
+ * Fetch products by tag using GraphQL cursor-based pagination.
+ * Respects Shopify's 250 page size limit and stops after maxToFetch items.
+ * Docs: https://shopify.dev/docs/api/usage/pagination-graphql
+ */
+async function fetchProductsByTagWithPagination(
+  client,
+  storeUrl,
+  accessToken,
+  tag,
+  maxToFetch
+) {
+  const collectedProducts = [];
+  let hasNextPage = true;
+  let afterCursor = null;
+
+  while (hasNextPage && collectedProducts.length < maxToFetch) {
+    const pageSize = Math.min(250, maxToFetch - collectedProducts.length);
+
+    const response = await handleGraphQLRequest(
+      client,
+      GRAPHQL_QUERIES.getProducts,
+      {
+        first: pageSize,
+        after: afterCursor,
+        query: `tag:${tag}`,
+        sortKey: "CREATED_AT",
+        reverse: true,
+      },
+      "getProducts",
+      storeUrl,
+      accessToken
+    );
+
+    const connection = response?.data?.data?.products;
+    const edges = connection?.edges || [];
+    const pageInfo = connection?.pageInfo;
+
+    for (const edge of edges) {
+      if (edge?.node) collectedProducts.push(edge.node);
+      if (collectedProducts.length >= maxToFetch) break;
+    }
+
+    hasNextPage = Boolean(pageInfo?.hasNextPage);
+    afterCursor = pageInfo?.endCursor || null;
+  }
+
+  // Extra safety: filter by tag in case query matches broader set
+  return collectedProducts.filter(
+    (p) => Array.isArray(p.tags) && p.tags.includes(tag)
+  );
+}
+
 // Query costs (Shopify's standard costs)
 const QUERY_COSTS = {
   createProduct: 10,
@@ -1240,6 +1293,9 @@ app.post("/api/benchmark/create", async (req, res) => {
     console.log(`Starting GraphQL product creation benchmark...`);
     console.log(`🔒 Using benchmark tag: benchmarkify`);
 
+    // Reset rate limit manager for fresh start
+    rateLimitManager.reset();
+
     // Create GraphQL client first
     const client = createGraphQLClient(storeUrl, accessToken);
 
@@ -1253,15 +1309,18 @@ app.post("/api/benchmark/create", async (req, res) => {
       accessToken
     );
 
-    const leakRate =
-      rateLimitResult.rateLimit?.leakRate ||
-      rateLimitResult.rateLimit?.restoreRate ||
-      100;
-    const { batchSize, delayBetweenBatches } =
-      calculateOptimalBatchConfig(leakRate);
+    // Initialize rate limit manager with initial response
+    rateLimitManager.updateFromResponse(
+      rateLimitResult.rateLimit,
+      rateLimitResult.success
+    );
+
+    // Get current optimal settings from manager
+    const { batchSize, delay: delayBetweenBatches } =
+      rateLimitManager.getCurrentSettings();
 
     console.log(
-      `📊 Creating ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
+      `📊 Creating ${count} products with adaptive rate limiting - Initial batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms`
     );
 
     const results = [];
@@ -1274,13 +1333,20 @@ app.post("/api/benchmark/create", async (req, res) => {
       batchStart < numProducts;
       batchStart += batchSize
     ) {
-      const batchEnd = Math.min(batchStart + batchSize, numProducts);
+      // Get current optimal settings (may have changed from previous batch)
+      const currentSettings = rateLimitManager.getCurrentSettings();
+      const currentBatchSize = currentSettings.batchSize;
+      const currentDelay = currentSettings.delay;
+
+      const batchEnd = Math.min(batchStart + currentBatchSize, numProducts);
       const batchSizeActual = batchEnd - batchStart;
 
       console.log(
         `🔄 Processing batch ${
-          Math.floor(batchStart / batchSize) + 1
-        }: products ${batchStart + 1}-${batchEnd}`
+          Math.floor(batchStart / currentBatchSize) + 1
+        }: products ${
+          batchStart + 1
+        }-${batchEnd} (batch size: ${currentBatchSize}, delay: ${currentDelay}ms)`
       );
 
       // Process batch in parallel
@@ -1288,24 +1354,29 @@ app.post("/api/benchmark/create", async (req, res) => {
       for (let i = batchStart; i < batchEnd; i++) {
         const productData = generateRandomProduct();
         batchPromises.push(
-          handleGraphQLRequest(
+          retryGraphQLRequest(
             client,
             GRAPHQL_QUERIES.createProduct,
             { product: productData },
             "createProduct",
             storeUrl,
             accessToken
-          ).catch((error) => ({
-            success: false,
-            error: error.message,
-            cost: QUERY_COSTS.createProduct,
-          }))
+          )
         );
       }
 
       // Wait for batch to complete
       const batchResults = await Promise.all(batchPromises);
       results.push(...batchResults);
+
+      // Log batch results for debugging
+      const batchSuccesses = batchResults.filter((r) => r.success).length;
+      const batchFailures = batchResults.filter((r) => !r.success).length;
+      console.log(
+        `📊 Batch ${
+          Math.floor(batchStart / currentBatchSize) + 1
+        } results: ${batchSuccesses} success, ${batchFailures} failures`
+      );
 
       // Store successful product IDs for direct deletion
       batchResults.forEach((result) => {
@@ -1317,41 +1388,10 @@ app.post("/api/benchmark/create", async (req, res) => {
         }
       });
 
-      // Check rate limit status and adapt if needed
-      const lastResult = batchResults[batchResults.length - 1];
-      if (lastResult && lastResult.rateLimit) {
-        const usagePercentage =
-          (lastResult.rateLimit.current / lastResult.rateLimit.limit) * 100;
-
-        if (usagePercentage > 80) {
-          // High usage - increase delay
-          const adaptiveDelay = Math.min(delayBetweenBatches * 2, 5000);
-          console.log(
-            `⚠️ High rate limit usage (${usagePercentage.toFixed(
-              1
-            )}%). Increasing delay to ${adaptiveDelay}ms`
-          );
-          await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-        } else if (usagePercentage < 40) {
-          // Low usage - reduce delay
-          const adaptiveDelay = Math.max(delayBetweenBatches * 0.5, 50);
-          console.log(
-            `✅ Low rate limit usage (${usagePercentage.toFixed(
-              1
-            )}%). Reducing delay to ${adaptiveDelay}ms`
-          );
-          await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-        } else {
-          // Normal usage - use configured delay
-          await new Promise((resolve) =>
-            setTimeout(resolve, delayBetweenBatches)
-          );
-        }
-      } else {
-        // Default delay if no rate limit info
-        await new Promise((resolve) =>
-          setTimeout(resolve, delayBetweenBatches)
-        );
+      // Use current delay from rate limit manager
+      if (batchStart + currentBatchSize < numProducts) {
+        console.log(`⏳ Waiting ${currentDelay}ms before next batch...`);
+        await new Promise((resolve) => setTimeout(resolve, currentDelay));
       }
     }
 
@@ -1403,6 +1443,9 @@ app.post("/api/benchmark/create", async (req, res) => {
     auditLog.summary.totalTime = totalTime;
     auditLog.summary.performanceProjections = performanceProjections;
 
+    // Get rate limit manager performance summary
+    const rateLimitSummary = rateLimitManager.getPerformanceSummary();
+
     res.json({
       status: successCount > 0 ? "success" : "error",
       responseTime: avgResponseTime,
@@ -1422,6 +1465,13 @@ app.post("/api/benchmark/create", async (req, res) => {
         productsPerSecond: (1000 / avgCost).toFixed(2), // Theoretical max based on cost
       },
       performanceProjections,
+      rateLimitAdaptation: rateLimitSummary,
+      retryStats: {
+        totalRetries: results.filter((r) => r.retriesExhausted).length,
+        successfulAfterRetry: results.filter(
+          (r) => r.success && r.retriesExhausted === false
+        ).length,
+      },
     });
   } catch (error) {
     console.error("Product creation benchmark error:", error);
@@ -1452,6 +1502,9 @@ app.post("/api/benchmark/delete", async (req, res) => {
     console.log("Starting GraphQL product deletion benchmark...");
     console.log(`🔒 Looking for products with tag: benchmarkify`);
 
+    // Reset rate limit manager for fresh start
+    rateLimitManager.reset();
+
     // Create GraphQL client first
     const client = createGraphQLClient(storeUrl, accessToken);
 
@@ -1465,47 +1518,32 @@ app.post("/api/benchmark/delete", async (req, res) => {
       accessToken
     );
 
-    const leakRate =
-      rateLimitResult.rateLimit?.leakRate ||
-      rateLimitResult.rateLimit?.restoreRate ||
-      100;
-    const { batchSize, delayBetweenBatches } =
-      calculateOptimalBatchConfig(leakRate);
-
-    console.log(
-      `📊 Deleting ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
+    // Initialize rate limit manager with initial response
+    rateLimitManager.updateFromResponse(
+      rateLimitResult.rateLimit,
+      rateLimitResult.success
     );
 
-    // Fetch products with "benchmarkify" tag directly from Shopify
-    console.log(`🔍 Fetching products with tag: benchmarkify`);
-    const directResult = await handleGraphQLRequest(
+    // Get current optimal settings from manager
+    const { batchSize, delay: delayBetweenBatches } =
+      rateLimitManager.getCurrentSettings();
+
+    console.log(
+      `📊 Deleting ${count} products with adaptive rate limiting - Initial batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms`
+    );
+
+    // Fetch products with "benchmarkify" tag using pagination (up to requested count)
+    console.log(`🔍 Fetching products with tag: benchmarkify (paginated)`);
+    const productsToDelete = await fetchProductsByTagWithPagination(
       client,
-      GRAPHQL_QUERIES.getProducts,
-      { first: 250, query: "tag:benchmarkify" },
-      "getProducts",
       storeUrl,
-      accessToken
+      accessToken,
+      "benchmarkify",
+      Math.max(1, Math.min(count, 1000000))
     );
     console.log(
-      `🔍 Direct GraphQL query result:`,
-      JSON.stringify(directResult, null, 2)
+      `🔍 Paginated fetch returned ${productsToDelete.length} products`
     );
-
-    let productsToDelete = [];
-    if (directResult.success && directResult.data?.data?.products?.edges) {
-      const fetched = directResult.data.data.products.edges.map(
-        (edge) => edge.node
-      );
-      console.log(`🔍 Direct query returned ${fetched.length} products`);
-      productsToDelete = fetched;
-    } else {
-      console.log(`🔍 Direct query failed or returned no products`);
-      console.log(
-        `🔍 Response structure:`,
-        JSON.stringify(directResult.data, null, 2)
-      );
-      productsToDelete = [];
-    }
 
     console.log(`🔍 Found ${productsToDelete.length} products to delete`);
 
@@ -1529,12 +1567,19 @@ app.post("/api/benchmark/delete", async (req, res) => {
         batchStart < deleteCount;
         batchStart += batchSize
       ) {
-        const batchEnd = Math.min(batchStart + batchSize, deleteCount);
+        // Get current optimal settings (may have changed from previous batch)
+        const currentSettings = rateLimitManager.getCurrentSettings();
+        const currentBatchSize = currentSettings.batchSize;
+        const currentDelay = currentSettings.delay;
+
+        const batchEnd = Math.min(batchStart + currentBatchSize, deleteCount);
 
         console.log(
           `🔄 Processing delete batch ${
-            Math.floor(batchStart / batchSize) + 1
-          }: products ${batchStart + 1}-${batchEnd}`
+            Math.floor(batchStart / currentBatchSize) + 1
+          }: products ${
+            batchStart + 1
+          }-${batchEnd} (batch size: ${currentBatchSize}, delay: ${currentDelay}ms)`
         );
 
         // Process batch in parallel
@@ -1543,18 +1588,14 @@ app.post("/api/benchmark/delete", async (req, res) => {
           const product = products[i];
 
           batchPromises.push(
-            handleGraphQLRequest(
+            retryGraphQLRequest(
               client,
               GRAPHQL_QUERIES.deleteProduct,
               { input: { id: product.id } },
               "deleteProduct",
               storeUrl,
               accessToken
-            ).catch((error) => ({
-              success: false,
-              error: error.message,
-              cost: QUERY_COSTS.deleteProduct,
-            }))
+            )
           );
         }
 
@@ -1562,41 +1603,19 @@ app.post("/api/benchmark/delete", async (req, res) => {
         const batchResults = await Promise.all(batchPromises);
         results.push(...batchResults);
 
-        // Check rate limit status and adapt if needed
-        const lastResult = batchResults[batchResults.length - 1];
-        if (lastResult && lastResult.rateLimit) {
-          const usagePercentage =
-            (lastResult.rateLimit.current / lastResult.rateLimit.limit) * 100;
+        // Log batch results for debugging
+        const batchSuccesses = batchResults.filter((r) => r.success).length;
+        const batchFailures = batchResults.filter((r) => !r.success).length;
+        console.log(
+          `📊 Delete batch ${
+            Math.floor(batchStart / currentBatchSize) + 1
+          } results: ${batchSuccesses} success, ${batchFailures} failures`
+        );
 
-          if (usagePercentage > 80) {
-            // High usage - increase delay
-            const adaptiveDelay = Math.min(delayBetweenBatches * 2, 5000);
-            console.log(
-              `⚠️ High rate limit usage (${usagePercentage.toFixed(
-                1
-              )}%). Increasing delay to ${adaptiveDelay}ms`
-            );
-            await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-          } else if (usagePercentage < 40) {
-            // Low usage - reduce delay
-            const adaptiveDelay = Math.max(delayBetweenBatches * 0.5, 50);
-            console.log(
-              `✅ Low rate limit usage (${usagePercentage.toFixed(
-                1
-              )}%). Reducing delay to ${adaptiveDelay}ms`
-            );
-            await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-          } else {
-            // Normal usage - use configured delay
-            await new Promise((resolve) =>
-              setTimeout(resolve, delayBetweenBatches)
-            );
-          }
-        } else {
-          // Default delay if no rate limit info
-          await new Promise((resolve) =>
-            setTimeout(resolve, delayBetweenBatches)
-          );
+        // Use current delay from rate limit manager
+        if (batchStart + currentBatchSize < deleteCount) {
+          console.log(`⏳ Waiting ${currentDelay}ms before next batch...`);
+          await new Promise((resolve) => setTimeout(resolve, currentDelay));
         }
       }
 
@@ -1648,6 +1667,9 @@ app.post("/api/benchmark/delete", async (req, res) => {
       auditLog.summary.totalTime = totalTime;
       auditLog.summary.performanceProjections = performanceProjections;
 
+      // Get rate limit manager performance summary
+      const rateLimitSummary = rateLimitManager.getPerformanceSummary();
+
       res.json({
         status: successCount > 0 ? "success" : "error",
         responseTime: avgResponseTime,
@@ -1667,6 +1689,13 @@ app.post("/api/benchmark/delete", async (req, res) => {
           productsPerSecond: (1000 / avgCost).toFixed(2),
         },
         performanceProjections,
+        rateLimitAdaptation: rateLimitSummary,
+        retryStats: {
+          totalRetries: results.filter((r) => r.retriesExhausted).length,
+          successfulAfterRetry: results.filter(
+            (r) => r.success && r.retriesExhausted === false
+          ).length,
+        },
       });
       return;
     } else {
@@ -1706,12 +1735,19 @@ app.post("/api/benchmark/delete", async (req, res) => {
         batchStart < deleteCount;
         batchStart += batchSize
       ) {
-        const batchEnd = Math.min(batchStart + batchSize, deleteCount);
+        // Get current optimal settings (may have changed from previous batch)
+        const currentSettings = rateLimitManager.getCurrentSettings();
+        const currentBatchSize = currentSettings.batchSize;
+        const currentDelay = currentSettings.delay;
+
+        const batchEnd = Math.min(batchStart + currentBatchSize, deleteCount);
 
         console.log(
           `🔄 Processing delete batch ${
-            Math.floor(batchStart / batchSize) + 1
-          }: products ${batchStart + 1}-${batchEnd}`
+            Math.floor(batchStart / currentBatchSize) + 1
+          }: products ${
+            batchStart + 1
+          }-${batchEnd} (batch size: ${currentBatchSize}, delay: ${currentDelay}ms)`
         );
 
         // Process batch in parallel
@@ -1720,18 +1756,14 @@ app.post("/api/benchmark/delete", async (req, res) => {
           const product = products[i];
 
           batchPromises.push(
-            handleGraphQLRequest(
+            retryGraphQLRequest(
               client,
               GRAPHQL_QUERIES.deleteProduct,
               { input: { id: product.id } },
               "deleteProduct",
               storeUrl,
               accessToken
-            ).catch((error) => ({
-              success: false,
-              error: error.message,
-              cost: QUERY_COSTS.deleteProduct,
-            }))
+            )
           );
         }
 
@@ -1739,41 +1771,19 @@ app.post("/api/benchmark/delete", async (req, res) => {
         const batchResults = await Promise.all(batchPromises);
         results.push(...batchResults);
 
-        // Check rate limit status and adapt if needed
-        const lastResult = batchResults[batchResults.length - 1];
-        if (lastResult && lastResult.rateLimit) {
-          const usagePercentage =
-            (lastResult.rateLimit.current / lastResult.rateLimit.limit) * 100;
+        // Log batch results for debugging
+        const batchSuccesses = batchResults.filter((r) => r.success).length;
+        const batchFailures = batchResults.filter((r) => !r.success).length;
+        console.log(
+          `📊 Delete batch ${
+            Math.floor(batchStart / currentBatchSize) + 1
+          } results: ${batchSuccesses} success, ${batchFailures} failures`
+        );
 
-          if (usagePercentage > 80) {
-            // High usage - increase delay
-            const adaptiveDelay = Math.min(delayBetweenBatches * 2, 5000);
-            console.log(
-              `⚠️ High rate limit usage (${usagePercentage.toFixed(
-                1
-              )}%). Increasing delay to ${adaptiveDelay}ms`
-            );
-            await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-          } else if (usagePercentage < 40) {
-            // Low usage - reduce delay
-            const adaptiveDelay = Math.max(delayBetweenBatches * 0.5, 50);
-            console.log(
-              `✅ Low rate limit usage (${usagePercentage.toFixed(
-                1
-              )}%). Reducing delay to ${adaptiveDelay}ms`
-            );
-            await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-          } else {
-            // Normal usage - use configured delay
-            await new Promise((resolve) =>
-              setTimeout(resolve, delayBetweenBatches)
-            );
-          }
-        } else {
-          // Default delay if no rate limit info
-          await new Promise((resolve) =>
-            setTimeout(resolve, delayBetweenBatches)
-          );
+        // Use current delay from rate limit manager
+        if (batchStart + currentBatchSize < deleteCount) {
+          console.log(`⏳ Waiting ${currentDelay}ms before next batch...`);
+          await new Promise((resolve) => setTimeout(resolve, currentDelay));
         }
       }
 
@@ -1840,6 +1850,13 @@ app.post("/api/benchmark/delete", async (req, res) => {
           productsPerSecond: (1000 / avgCost).toFixed(2),
         },
         performanceProjections,
+        rateLimitAdaptation: rateLimitSummary,
+        retryStats: {
+          totalRetries: results.filter((r) => r.retriesExhausted).length,
+          successfulAfterRetry: results.filter(
+            (r) => r.success && r.retriesExhausted === false
+          ).length,
+        },
       });
     }
   } catch (error) {
@@ -1870,6 +1887,9 @@ app.post("/api/benchmark/update", async (req, res) => {
     console.log("Starting GraphQL product update benchmark...");
     console.log(`🔒 Looking for products with tag: benchmarkify`);
 
+    // Reset rate limit manager for fresh start
+    rateLimitManager.reset();
+
     // Create GraphQL client first
     const client = createGraphQLClient(storeUrl, accessToken);
 
@@ -1883,47 +1903,30 @@ app.post("/api/benchmark/update", async (req, res) => {
       accessToken
     );
 
-    const leakRate =
-      rateLimitResult.rateLimit?.leakRate ||
-      rateLimitResult.rateLimit?.restoreRate ||
-      100;
-    const { batchSize, delayBetweenBatches } =
-      calculateOptimalBatchConfig(leakRate);
-
-    console.log(
-      `📊 Updating ${count} products with dynamic config - Batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms (Leak rate: ${leakRate} points/sec)`
+    // Initialize rate limit manager with initial response
+    rateLimitManager.updateFromResponse(
+      rateLimitResult.rateLimit,
+      rateLimitResult.success
     );
 
-    // Fetch products with "benchmarkify" tag directly from Shopify
-    console.log(`🔍 Fetching products with tag: benchmarkify`);
-    const directResult = await handleGraphQLRequest(
+    // Get current optimal settings from manager
+    const { batchSize, delay: delayBetweenBatches } =
+      rateLimitManager.getCurrentSettings();
+
+    console.log(
+      `📊 Updating ${count} products with adaptive rate limiting - Initial batch size: ${batchSize}, Delay: ${delayBetweenBatches}ms`
+    );
+
+    // Fetch products with "benchmarkify" tag using pagination (up to requested count)
+    console.log(`🔍 Fetching products with tag: benchmarkify (paginated)`);
+    const allProducts = await fetchProductsByTagWithPagination(
       client,
-      GRAPHQL_QUERIES.getProducts,
-      { first: 250, query: "tag:benchmarkify" },
-      "getProducts",
       storeUrl,
-      accessToken
+      accessToken,
+      "benchmarkify",
+      Math.max(1, Math.min(count, 1000000))
     );
-    console.log(
-      `🔍 Direct GraphQL query result:`,
-      JSON.stringify(directResult, null, 2)
-    );
-
-    let allProducts = [];
-    if (directResult.success && directResult.data?.data?.products?.edges) {
-      const fetched = directResult.data.data.products.edges.map(
-        (edge) => edge.node
-      );
-      console.log(`🔍 Direct query returned ${fetched.length} products`);
-      allProducts = fetched;
-    } else {
-      console.log(`🔍 Direct query failed or returned no products`);
-      console.log(
-        `🔍 Response structure:`,
-        JSON.stringify(directResult.data, null, 2)
-      );
-      allProducts = [];
-    }
+    console.log(`🔍 Paginated fetch returned ${allProducts.length} products`);
 
     console.log(`🔍 Found ${allProducts.length} products to update`);
 
@@ -1963,12 +1966,19 @@ app.post("/api/benchmark/update", async (req, res) => {
       batchStart < updateCount;
       batchStart += batchSize
     ) {
-      const batchEnd = Math.min(batchStart + batchSize, updateCount);
+      // Get current optimal settings (may have changed from previous batch)
+      const currentSettings = rateLimitManager.getCurrentSettings();
+      const currentBatchSize = currentSettings.batchSize;
+      const currentDelay = currentSettings.delay;
+
+      const batchEnd = Math.min(batchStart + currentBatchSize, updateCount);
 
       console.log(
         `🔄 Processing update batch ${
-          Math.floor(batchStart / batchSize) + 1
-        }: products ${batchStart + 1}-${batchEnd}`
+          Math.floor(batchStart / currentBatchSize) + 1
+        }: products ${
+          batchStart + 1
+        }-${batchEnd} (batch size: ${currentBatchSize}, delay: ${currentDelay}ms)`
       );
 
       // Process batch in parallel
@@ -1984,18 +1994,14 @@ app.post("/api/benchmark/update", async (req, res) => {
         };
 
         batchPromises.push(
-          handleGraphQLRequest(
+          retryGraphQLRequest(
             client,
             GRAPHQL_QUERIES.updateProduct,
             { input: updateData },
             "updateProduct",
             storeUrl,
             accessToken
-          ).catch((error) => ({
-            success: false,
-            error: error.message,
-            cost: QUERY_COSTS.updateProduct,
-          }))
+          )
         );
       }
 
@@ -2003,41 +2009,19 @@ app.post("/api/benchmark/update", async (req, res) => {
       const batchResults = await Promise.all(batchPromises);
       results.push(...batchResults);
 
-      // Check rate limit status and adapt if needed
-      const lastResult = batchResults[batchResults.length - 1];
-      if (lastResult && lastResult.rateLimit) {
-        const usagePercentage =
-          (lastResult.rateLimit.current / lastResult.rateLimit.limit) * 100;
+      // Log batch results for debugging
+      const batchSuccesses = batchResults.filter((r) => r.success).length;
+      const batchFailures = batchResults.filter((r) => !r.success).length;
+      console.log(
+        `📊 Update batch ${
+          Math.floor(batchStart / currentBatchSize) + 1
+        } results: ${batchSuccesses} success, ${batchFailures} failures`
+      );
 
-        if (usagePercentage > 80) {
-          // High usage - increase delay
-          const adaptiveDelay = Math.min(delayBetweenBatches * 2, 5000);
-          console.log(
-            `⚠️ High rate limit usage (${usagePercentage.toFixed(
-              1
-            )}%). Increasing delay to ${adaptiveDelay}ms`
-          );
-          await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-        } else if (usagePercentage < 40) {
-          // Low usage - reduce delay
-          const adaptiveDelay = Math.max(delayBetweenBatches * 0.5, 50);
-          console.log(
-            `✅ Low rate limit usage (${usagePercentage.toFixed(
-              1
-            )}%). Reducing delay to ${adaptiveDelay}ms`
-          );
-          await new Promise((resolve) => setTimeout(resolve, adaptiveDelay));
-        } else {
-          // Normal usage - use configured delay
-          await new Promise((resolve) =>
-            setTimeout(resolve, delayBetweenBatches)
-          );
-        }
-      } else {
-        // Default delay if no rate limit info
-        await new Promise((resolve) =>
-          setTimeout(resolve, delayBetweenBatches)
-        );
+      // Use current delay from rate limit manager
+      if (batchStart + currentBatchSize < updateCount) {
+        console.log(`⏳ Waiting ${currentDelay}ms before next batch...`);
+        await new Promise((resolve) => setTimeout(resolve, currentDelay));
       }
     }
 
@@ -2084,6 +2068,9 @@ app.post("/api/benchmark/update", async (req, res) => {
       products10m: calculateProjection(10000000),
     };
 
+    // Get rate limit manager performance summary
+    const rateLimitSummary = rateLimitManager.getPerformanceSummary();
+
     res.json({
       status: successCount > 0 ? "success" : "error",
       responseTime: avgResponseTime,
@@ -2103,6 +2090,13 @@ app.post("/api/benchmark/update", async (req, res) => {
         productsPerSecond: (1000 / avgCost).toFixed(2),
       },
       performanceProjections,
+      rateLimitAdaptation: rateLimitSummary,
+      retryStats: {
+        totalRetries: results.filter((r) => r.retriesExhausted).length,
+        successfulAfterRetry: results.filter(
+          (r) => r.success && r.retriesExhausted === false
+        ).length,
+      },
     });
   } catch (error) {
     console.error("Product update benchmark error:", error);
@@ -2340,3 +2334,245 @@ app.listen(PORT, () => {
     `🔍 Features: Rate limit monitoring, Query cost analysis, Performance metrics`
   );
 });
+
+// Rate limiting and retry management system
+class RateLimitManager {
+  constructor() {
+    this.currentBatchSize = 10;
+    this.currentDelay = 100;
+    this.maxBatchSize = 100;
+    this.minDelay = 50;
+    this.maxDelay = 5000;
+    this.retryAttempts = 3;
+    this.retryDelay = 1000;
+    this.rateLimitHistory = [];
+    this.failureHistory = [];
+  }
+
+  // Update settings based on rate limit response
+  updateFromResponse(rateLimitInfo, success = true) {
+    if (success && rateLimitInfo) {
+      const usagePercentage =
+        (rateLimitInfo.current / rateLimitInfo.limit) * 100;
+
+      // Store rate limit info
+      this.rateLimitHistory.push({
+        timestamp: Date.now(),
+        usage: usagePercentage,
+        current: rateLimitInfo.current,
+        limit: rateLimitInfo.limit,
+        remaining: rateLimitInfo.remaining,
+        leakRate: rateLimitInfo.leakRate || rateLimitInfo.restoreRate,
+      });
+
+      // Adjust batch size and delay based on usage
+      if (usagePercentage > 85) {
+        // High usage - reduce batch size and increase delay
+        this.currentBatchSize = Math.max(
+          1,
+          Math.floor(this.currentBatchSize * 0.7)
+        );
+        this.currentDelay = Math.min(
+          this.maxDelay,
+          Math.floor(this.currentDelay * 1.5)
+        );
+        console.log(
+          `⚠️ High rate limit usage (${usagePercentage.toFixed(
+            1
+          )}%). Reducing batch size to ${
+            this.currentBatchSize
+          }, increasing delay to ${this.currentDelay}ms`
+        );
+      } else if (usagePercentage > 70) {
+        // Moderate usage - slight reduction
+        this.currentBatchSize = Math.max(
+          1,
+          Math.floor(this.currentBatchSize * 0.9)
+        );
+        this.currentDelay = Math.min(
+          this.maxDelay,
+          Math.floor(this.currentDelay * 1.2)
+        );
+        console.log(
+          `⚠️ Moderate rate limit usage (${usagePercentage.toFixed(
+            1
+          )}%). Adjusting batch size to ${this.currentBatchSize}, delay to ${
+            this.currentDelay
+          }ms`
+        );
+      } else if (usagePercentage < 30) {
+        // Low usage - increase batch size and reduce delay
+        this.currentBatchSize = Math.min(
+          this.maxBatchSize,
+          Math.floor(this.currentBatchSize * 1.2)
+        );
+        this.currentDelay = Math.max(
+          this.minDelay,
+          Math.floor(this.currentDelay * 0.8)
+        );
+        console.log(
+          `✅ Low rate limit usage (${usagePercentage.toFixed(
+            1
+          )}%). Increasing batch size to ${
+            this.currentBatchSize
+          }, reducing delay to ${this.currentDelay}ms`
+        );
+      }
+    }
+  }
+
+  // Get current optimal settings
+  getCurrentSettings() {
+    return {
+      batchSize: this.currentBatchSize,
+      delay: this.currentDelay,
+    };
+  }
+
+  // Calculate retry delay with exponential backoff
+  getRetryDelay(attempt) {
+    return Math.min(this.retryDelay * Math.pow(2, attempt), this.maxDelay);
+  }
+
+  // Record failure for analysis
+  recordFailure(error, operation) {
+    this.failureHistory.push({
+      timestamp: Date.now(),
+      error: error.message,
+      operation,
+      batchSize: this.currentBatchSize,
+      delay: this.currentDelay,
+    });
+
+    // If we have many recent failures, reduce batch size
+    const recentFailures = this.failureHistory.filter(
+      (f) => Date.now() - f.timestamp < 60000 // Last minute
+    );
+
+    if (recentFailures.length > 5) {
+      this.currentBatchSize = Math.max(
+        1,
+        Math.floor(this.currentBatchSize * 0.8)
+      );
+      this.currentDelay = Math.min(
+        this.maxDelay,
+        Math.floor(this.currentDelay * 1.3)
+      );
+      console.log(
+        `🚨 High failure rate detected. Reducing batch size to ${this.currentBatchSize}, increasing delay to ${this.currentDelay}ms`
+      );
+      // Clear failure history to avoid continuous reduction
+      this.failureHistory = [];
+    }
+  }
+
+  // Get performance summary
+  getPerformanceSummary() {
+    if (this.rateLimitHistory.length === 0) return null;
+
+    const recent = this.rateLimitHistory.slice(-10);
+    const avgUsage =
+      recent.reduce((sum, r) => sum + r.usage, 0) / recent.length;
+    const avgLeakRate =
+      recent.reduce((sum, r) => sum + (r.leakRate || 100), 0) / recent.length;
+
+    return {
+      averageUsage: avgUsage,
+      averageLeakRate: avgLeakRate,
+      currentBatchSize: this.currentBatchSize,
+      currentDelay: this.currentDelay,
+      totalRateLimitChecks: this.rateLimitHistory.length,
+      totalFailures: this.failureHistory.length,
+    };
+  }
+
+  // Reset manager for new operation
+  reset() {
+    this.currentBatchSize = 10;
+    this.currentDelay = 100;
+    this.rateLimitHistory = [];
+    this.failureHistory = [];
+    console.log(`🔄 Rate limit manager reset to default settings`);
+  }
+}
+
+// Global rate limit manager
+const rateLimitManager = new RateLimitManager();
+
+// Retry wrapper for GraphQL requests with exponential backoff
+async function retryGraphQLRequest(
+  client,
+  query,
+  variables,
+  operationName,
+  storeUrl,
+  accessToken,
+  maxRetries = 3
+) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await handleGraphQLRequest(
+        client,
+        query,
+        variables,
+        operationName,
+        storeUrl,
+        accessToken
+      );
+
+      // Update rate limit manager with response info
+      rateLimitManager.updateFromResponse(result.rateLimit, result.success);
+
+      if (result.success) {
+        return result;
+      } else {
+        // Log the failure
+        console.log(
+          `❌ ${operationName} failed (attempt ${attempt + 1}/${
+            maxRetries + 1
+          }): ${result.error}`
+        );
+        lastError = result.error;
+
+        // Record failure for rate limit analysis
+        rateLimitManager.recordFailure(new Error(result.error), operationName);
+
+        // If this is a rate limit error, wait longer
+        if (result.error && result.error.includes("rate limit")) {
+          const retryDelay = rateLimitManager.getRetryDelay(attempt);
+          console.log(
+            `⏳ Rate limit hit, waiting ${retryDelay}ms before retry...`
+          );
+          await new Promise((resolve) => setTimeout(resolve, retryDelay));
+        }
+      }
+    } catch (error) {
+      console.log(
+        `❌ ${operationName} threw error (attempt ${attempt + 1}/${
+          maxRetries + 1
+        }): ${error.message}`
+      );
+      lastError = error;
+
+      // Record failure for rate limit analysis
+      rateLimitManager.recordFailure(error, operationName);
+
+      // If this is the last attempt, don't wait
+      if (attempt < maxRetries) {
+        const retryDelay = rateLimitManager.getRetryDelay(attempt);
+        console.log(`⏳ Waiting ${retryDelay}ms before retry...`);
+        await new Promise((resolve) => setTimeout(resolve, retryDelay));
+      }
+    }
+  }
+
+  // All retries exhausted
+  return {
+    success: false,
+    error: `All ${maxRetries + 1} attempts failed. Last error: ${lastError}`,
+    cost: QUERY_COSTS[operationName] || 0,
+    retriesExhausted: true,
+  };
+}
